@@ -7,7 +7,7 @@
 - **实时视频识别**：CameraX 视频帧 -> YUV 转换 -> OpenCV YuNet 多人脸检测 -> SFace 对齐与特征提取 -> 本机身份比对 -> 跨帧跟踪 -> 画面人脸框与姓名标签。
 - **实时语音转录**：Android `AudioRecord` 采集 16 kHz PCM -> dBFS 输入电平 -> Vosk 离线中文语音识别 -> 说话人关联 -> 本机 SQLite 转写历史。
 - 已登记的人显示登记姓名；未知人显示 `陌生人 A`、`陌生人 B` 等会话内编号。陌生人编号在应用会话结束后重置。
-- 转写历史保存文本、时间和说话人标签。应用不保存或上传原始音频、人脸特征或转写内容。
+- 本机 SQLite 保存登记姓名、人脸特征，以及转写文本、时间和说话人标签。应用不保存原始音频，当前版本不上传这些数据。
 - 单人画面默认把语音关联到该人。多人同框时需要用户点选正在说话的人脸；项目没有声纹分离，不应宣称能仅靠语音自动判断说话人。
 - 开始采集前需勾选参与者知情同意。录音面板显示 dBFS；低于 `-55 dBFS` 会提示没有明显声音，识别输出还要求语音能量达到 `-52 dBFS` 门限，以减少低音量噪声造成的误识别。
 
@@ -49,10 +49,10 @@ AGENT_HANDOFF.md        完整模拟器设置、安装步骤和 Agent 交接提�
 
 ```powershell
 git clone https://github.com/anthonyscut/live-face-transcript-mec.git
-cd live-face-transcript
+cd live-face-transcript-mec
 ```
 
-在 Android Studio 中打开工程目录 `live-face-transcript/`。若在 PowerShell 命令行构建：
+在 Android Studio 中打开克隆后的工程根目录 `live-face-transcript-mec/`（其中包含 `settings.gradle`）。若在 PowerShell 命令行构建：
 
 ```powershell
 $env:JAVA_HOME = 'C:\Program Files\Android\openjdk\jdk-21.0.8'
@@ -127,6 +127,7 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
 ## 团队协作
 
+- 详细流程、分工建议与人工验收清单见 [CONTRIBUTING.md](CONTRIBUTING.md)；后续课程实验见 [ROADMAP.md](ROADMAP.md)。
 - 默认协作分支为 `main`；每个功能或修复从 `main` 建立短期分支，例如 `feature/audio-meter`、`fix/face-tracking`。
 - 通过 Pull Request 合并；PR 描述需包含改动目的、复现/验证步骤、模拟器或实体机信息及截图（确认参与者同意后才提交含人物的截图）。
 - 不提交 `local.properties`、Gradle 缓存、`app/build/`、APK、录音、人脸登记数据库或个人测试数据。
@@ -135,6 +136,7 @@ $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 
 ## 维护与已知限制
 
+- 当前仓库是本机人脸识别与语音转录原型；尚未实现 Python 服务端、静态卸载切分、动态卸载决策与能耗实验，不能把此版本直接视为已完成课程 Part B/C。
 - 人脸匹配质量受光照、角度、距离、遮挡和相机质量影响；登记库只保存在当前设备。
 - 未知人编号为会话级身份，不保证跨天或跨会话追踪同一陌生人。
 - 没有声纹识别或自动说话人分离；多人场景需手动选择说话人。
