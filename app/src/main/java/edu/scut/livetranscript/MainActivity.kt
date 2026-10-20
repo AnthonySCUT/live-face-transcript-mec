@@ -34,10 +34,8 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.setPadding
 import com.google.android.material.card.MaterialCardView
-import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.vosk.Model
-import org.vosk.Recognizer
 import org.vosk.android.StorageService
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
@@ -63,7 +61,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var frameHeight = 480
     @Volatile private var lastSpeechSpeaker = "未确认说话人"
     private var speechModel: Model? = null
-    private var voskRecognizer: Recognizer? = null
+    private var speechEngine: SpeechEngine? = null
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
     @Volatile private var audioCaptureRunning = false
@@ -334,8 +332,9 @@ class MainActivity : AppCompatActivity() {
         if (!running || speechModel == null || audioCaptureRunning) return
         try {
             val model = speechModel ?: return
-            val recognizer = Recognizer(model, 16_000.0f)
-            voskRecognizer = recognizer
+            val engine = VoskSpeechEngine(model)
+            speechEngine = engine
+            engine.start(::onSpeechEvent)
             val minBuffer = AudioRecord.getMinBufferSize(
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
@@ -358,21 +357,20 @@ class MainActivity : AppCompatActivity() {
             check(recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "Android 未进入麦克风录音状态" }
             audioCaptureRunning = true
             speechStatus.text = "麦克风已连接 · 正在检查输入电平…"
-            audioThread = Thread({ captureAndRecognize(recorder, recognizer) }, "live-transcript-audio").apply { start() }
+            audioThread = Thread({ captureAudio(recorder, engine) }, "live-transcript-audio").apply { start() }
         } catch (error: Exception) {
             audioCaptureRunning = false
             audioRecord?.release()
             audioRecord = null
-            voskRecognizer?.close()
-            voskRecognizer = null
+            speechEngine?.stop()
+            speechEngine = null
             runOnUiThread { speechStatus.text = "本机语音启动失败：${error.localizedMessage ?: "未知错误"}" }
         }
     }
 
-    private fun captureAndRecognize(recorder: AudioRecord, recognizer: Recognizer) {
+    private fun captureAudio(recorder: AudioRecord, engine: SpeechEngine) {
         val samples = ShortArray(AUDIO_CHUNK_SAMPLES)
         var lastMeterUpdate = 0L
-        var speechEnergySeen = false
         try {
             while (audioCaptureRunning && running) {
                 val count = recorder.read(samples, 0, samples.size, AudioRecord.READ_BLOCKING)
@@ -386,7 +384,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 val rms = kotlin.math.sqrt(energy / count)
                 val levelDb = if (rms > 0.0) 20.0 * kotlin.math.log10(rms / 32768.0) else -96.0
-                if (levelDb >= MIN_SPEECH_DBFS) speechEnergySeen = true
                 val now = SystemClock.elapsedRealtime()
                 if (now - lastMeterUpdate >= AUDIO_METER_INTERVAL_MS) {
                     lastMeterUpdate = now
@@ -400,23 +397,23 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                if (recognizer.acceptWaveForm(samples, count)) {
-                    val recognized = JSONObject(recognizer.result).optString("text")
-                    if (speechEnergySeen) commitVoskText(recognized)
-                    speechEnergySeen = false
-                } else if (speechEnergySeen) {
-                    val partial = JSONObject(recognizer.partialResult).optString("partial").trim()
-                    if (partial.isNotEmpty()) runOnUiThread {
-                        val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
-                        transcriptPreview.text = "$speaker：$partial"
-                    }
-                }
+                engine.acceptPcm(samples, count, now)
             }
         } catch (error: Exception) {
             if (running) runOnUiThread {
                 speechStatus.text = "麦克风采集失败：${error.localizedMessage ?: "请检查系统麦克风输入"}"
             }
         }
+    }
+
+    private fun onSpeechEvent(event: SpeechEvent) {
+        if (!running) return
+        if (event.isFinal) {
+            commitVoskText(event.text)
+            return
+        }
+        val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
+        runOnUiThread { transcriptPreview.text = "$speaker：${event.text}" }
     }
 
     private fun commitVoskText(rawText: String) {
@@ -490,8 +487,8 @@ class MainActivity : AppCompatActivity() {
             Thread.currentThread().interrupt()
         }
         audioThread = null
-        voskRecognizer?.close()
-        voskRecognizer = null
+        speechEngine?.stop()
+        speechEngine = null
         analysisUseCase?.clearAnalyzer()
         analysisUseCase = null
         cameraProvider?.unbindAll()
