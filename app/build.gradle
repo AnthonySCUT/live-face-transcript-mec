@@ -3,16 +3,20 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+def funasrWsUrl = providers.gradleProperty('funasrWsUrl').getOrElse('ws://10.0.2.2:10095')
+
 android {
     namespace 'edu.scut.livetranscript'
     compileSdk 35
     buildToolsVersion '35.0.0'
+    buildFeatures { buildConfig true }
     defaultConfig {
         applicationId 'edu.scut.livetranscript'
         minSdk 26
         targetSdk 35
         versionCode 1
         versionName '1.0'
+        buildConfigField 'String', 'FUNASR_WS_URL', "\"${funasrWsUrl}\""
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -33,5 +37,7 @@ dependencies {
     implementation 'org.opencv:opencv:4.10.0'
     implementation 'net.java.dev.jna:jna:5.18.1@aar'
     implementation 'com.alphacephei:vosk-android:0.3.75@aar'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
 }

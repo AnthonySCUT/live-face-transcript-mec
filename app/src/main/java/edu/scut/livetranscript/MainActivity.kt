@@ -55,11 +55,15 @@ class MainActivity : AppCompatActivity() {
     private val store by lazy { LocalStore(this) }
     private val pipeline by lazy { FacePipeline(this) }
     @Volatile private var running = false
+    @Volatile private var speechDrainUntilMs = 0L
+    @Volatile private var sessionGeneration = 0L
+    private val speechEventLock = Any()
     @Volatile private var currentFaces: List<TrackedFace> = emptyList()
     @Volatile private var selectedTrackId: Int? = null
     @Volatile private var frameWidth = 640
     @Volatile private var frameHeight = 480
     @Volatile private var lastSpeechSpeaker = "未确认说话人"
+    @Volatile private var speechEngineStatus = "识别服务尚未启动"
     private var speechModel: Model? = null
     private var speechEngine: SpeechEngine? = null
     private var audioRecord: AudioRecord? = null
@@ -119,7 +123,7 @@ class MainActivity : AppCompatActivity() {
 
         page.addView(label("LIVE SESSION", 12f, 0xFF176B62.toInt(), true))
         page.addView(label("人脸与语音记录", 25f, 0xFF172321.toInt(), true).top(4))
-        page.addView(label("识别框架优先离线运行 · 只保存转写文本，不保存音频", 13f, 0xFF586561.toInt()).top(3))
+        page.addView(label("实时音频通过已配置服务识别 · 不保存音频 · 转写文本仅保存在本机", 13f, 0xFF586561.toInt()).top(3))
 
         liveBadge = label("● 已停止", 13f, 0xFF586561.toInt(), true).top(10)
         page.addView(liveBadge)
@@ -221,7 +225,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun beginSession() {
         pendingStart = false
-        running = true
+        synchronized(speechEventLock) {
+            sessionGeneration++
+            speechDrainUntilMs = 0L
+            running = true
+        }
         startButton.text = "停止采集"
         consent.isEnabled = false
         liveBadge.text = "● CAMERA ON · MIC ON"
@@ -303,15 +311,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun startSpeechRecognition() {
         if (audioCaptureRunning) {
-            speechStatus.text = "本机离线中文识别运行中"
+            speechStatus.text = "实时语音识别运行中"
             return
         }
         if (modelLoading) {
-            speechStatus.text = "正在解压离线中文模型…"
+            speechStatus.text = "正在加载本地中文后备模型…"
             return
         }
         modelLoading = true
-        speechStatus.text = "正在加载离线中文模型…"
+        speechEngineStatus = "正在加载本地中文后备模型…"
+        speechStatus.text = speechEngineStatus
         StorageService.unpack(
             this,
             "models/vosk-model-small-cn-0.22",
@@ -319,22 +328,32 @@ class MainActivity : AppCompatActivity() {
             { model ->
                 modelLoading = false
                 speechModel = model
-                if (running) startVoskRecognition()
+                if (running) startFunAsrRecognition(VoskSpeechEngine(model), sessionGeneration)
             },
             { error ->
                 modelLoading = false
-                runOnUiThread { speechStatus.text = "离线模型加载失败：${error.message ?: "未知错误"}" }
+                speechEngineStatus = "本地中文后备加载失败：${error.message ?: "未知错误"}"
+                runOnUiThread { if (running) speechStatus.text = speechEngineStatus }
+                if (running) startFunAsrRecognition(null, sessionGeneration)
             }
         )
     }
 
-    private fun startVoskRecognition() {
-        if (!running || speechModel == null || audioCaptureRunning) return
+    private fun startFunAsrRecognition(localFallback: SpeechEngine?, generation: Long) {
+        if (!running || generation != sessionGeneration || audioCaptureRunning) return
         try {
-            val model = speechModel ?: return
-            val engine = VoskSpeechEngine(model)
+            val engine = FunAsrSpeechEngine(
+                endpoint = BuildConfig.FUNASR_WS_URL,
+                fallback = localFallback,
+                onStatus = { message ->
+                    if (running && generation == sessionGeneration) {
+                        speechEngineStatus = message
+                        runOnUiThread { if (running && generation == sessionGeneration) speechStatus.text = message }
+                    }
+                }
+            )
             speechEngine = engine
-            engine.start(::onSpeechEvent)
+            engine.start { event -> onSpeechEvent(event, generation) }
             val minBuffer = AudioRecord.getMinBufferSize(
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
@@ -364,7 +383,8 @@ class MainActivity : AppCompatActivity() {
             audioRecord = null
             speechEngine?.stop()
             speechEngine = null
-            runOnUiThread { speechStatus.text = "本机语音启动失败：${error.localizedMessage ?: "未知错误"}" }
+            speechEngineStatus = "语音启动失败：${error.localizedMessage ?: "未知错误"}"
+            runOnUiThread { speechStatus.text = speechEngineStatus }
         }
     }
 
@@ -390,9 +410,9 @@ class MainActivity : AppCompatActivity() {
                     val level = levelDb.roundToInt()
                     runOnUiThread {
                         speechStatus.text = if (level < MIN_AUDIBLE_DBFS) {
-                            "麦克风输入 ${level} dBFS · 未检测到明显声音"
+                            "麦克风输入 ${level} dBFS · $speechEngineStatus"
                         } else {
-                            "麦克风正在收音 ${level} dBFS · 本机离线识别"
+                            "麦克风正在收音 ${level} dBFS · $speechEngineStatus"
                         }
                     }
                 }
@@ -400,40 +420,47 @@ class MainActivity : AppCompatActivity() {
                 engine.acceptPcm(samples, count, now)
             }
         } catch (error: Exception) {
-            if (running) runOnUiThread {
-                speechStatus.text = "麦克风采集失败：${error.localizedMessage ?: "请检查系统麦克风输入"}"
+            if (running) {
+                speechEngineStatus = "麦克风采集失败：${error.localizedMessage ?: "请检查系统麦克风输入"}"
+                runOnUiThread {
+                    speechStatus.text = speechEngineStatus
+                }
             }
         }
     }
 
-    private fun onSpeechEvent(event: SpeechEvent) {
-        if (!running) return
-        if (event.isFinal) {
-            commitVoskText(event.text)
-            return
+    private fun onSpeechEvent(event: SpeechEvent, generation: Long) {
+        synchronized(speechEventLock) {
+            if (generation != sessionGeneration) return
+            if (!running && (!event.isFinal || SystemClock.elapsedRealtime() > speechDrainUntilMs)) return
+            if (event.isFinal) {
+                commitSpeechText(event.text, generation)
+                return
+            }
+            val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
+            runOnUiThread { if (running) transcriptPreview.text = "$speaker：${event.text}" }
         }
-        val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
-        runOnUiThread { transcriptPreview.text = "$speaker：${event.text}" }
     }
 
-    private fun commitVoskText(rawText: String) {
+    private fun commitSpeechText(rawText: String, generation: Long) {
         val text = rawText.trim()
         if (text.isEmpty()) return
         val now = SystemClock.elapsedRealtime()
         if (text == lastCommittedSpeech && now - lastCommittedAt < 1800L) return
         lastCommittedSpeech = text
         lastCommittedAt = now
-        saveUtterance(text)
+        saveUtterance(text, generation)
     }
 
-    private fun saveUtterance(text: String) {
+    private fun saveUtterance(text: String, generation: Long) {
         val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
         lastSpeechSpeaker = speaker
         store.addUtterance(speaker, text)
         runOnUiThread {
-            transcriptPreview.text = "$speaker：$text"
-            speechStatus.text = "已保存到本机 · 识别下一句中"
             refreshTranscriptList()
+            if (!running || generation != sessionGeneration) return@runOnUiThread
+            transcriptPreview.text = "$speaker：$text"
+            speechStatus.text = "已保存到本机 · $speechEngineStatus"
         }
     }
 
@@ -472,7 +499,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopSession() {
-        running = false
+        synchronized(speechEventLock) {
+            speechDrainUntilMs = SystemClock.elapsedRealtime() + 2_000L
+            running = false
+        }
         audioCaptureRunning = false
         val recorder = audioRecord
         audioRecord = null
@@ -502,7 +532,8 @@ class MainActivity : AppCompatActivity() {
         liveBadge.text = "● 已停止"
         liveBadge.setTextColor(0xFF586561.toInt())
         transcriptPreview.text = "采集已停止"
-        speechStatus.text = "识别已停止 · 历史文本保留在本机"
+        speechEngineStatus = "识别已停止 · 历史文本保留在本机"
+        speechStatus.text = speechEngineStatus
         status.text = "摄像头与麦克风已关闭。转写文本保存在本机。"
     }
 
