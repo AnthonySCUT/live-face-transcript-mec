@@ -37,6 +37,7 @@
 - Create: `app/src/main/java/edu/scut/livetranscript/VoskSpeechEngine.kt`
 - Modify: `app/src/main/java/edu/scut/livetranscript/MainActivity.kt`
 - Test: `app/src/test/java/edu/scut/livetranscript/SpeechEventTest.kt`
+- Modify: `app/build.gradle` (add JUnit 4 test dependency)
 
 **Interfaces:**
 - Produce `data class SpeechEvent(val text: String, val startedAtMs: Long, val endedAtMs: Long, val isFinal: Boolean)`; time uses `SystemClock.elapsedRealtime()`.
@@ -110,4 +111,4 @@
 
 ## Execution boundary
 
-Compilation and unit tests verify only code-level behavior. End-to-end acceptance requires installing and running the APK on an emulator with working camera and microphone input, and measuring real transcription, attribution, and latency. The initial request deferred deployment while requirements were being clarified; execution should include deployment after implementation is ready. Before live camera/microphone testing, use consenting participants. The local directory currently has no `.git`; inspect the remote repository history and reconcile the unpacked files before any commit rather than running `git init` blindly.
+Compilation and unit tests verify only code-level behavior. End-to-end acceptance requires installing and running the APK on an emulator with working camera and microphone input, and measuring real transcription, attribution, and latency. Before live camera/microphone testing, use consenting participants. The project is on `feature/live-bilingual-speaker`, based on the verified GitHub `main` revision; the initial unpacked source files were checked against that revision before Git metadata was initialized.
