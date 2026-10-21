@@ -23,6 +23,11 @@ class FaceTracker {
     private val tracks = mutableListOf<Track>()
     private var nextId = 1
 
+    @Synchronized fun clear() {
+        tracks.clear()
+        nextId = 1
+    }
+
     @Synchronized fun update(samples: List<FaceSample>, knownPeople: List<Participant>, now: Long): List<TrackedFace> {
         tracks.removeAll { now - it.seenAt > TRACK_TIMEOUT_MS }
         val claimed = mutableSetOf<Int>()

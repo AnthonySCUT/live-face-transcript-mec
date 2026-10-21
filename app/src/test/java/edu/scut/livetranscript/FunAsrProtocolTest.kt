@@ -108,6 +108,146 @@ class FunAsrProtocolTest {
         engine.stop()
     }
 
+    @Test
+    fun delayedRemoteResultsKeepTheTimestampOfTheirSourceSpeechWindow() {
+        val factory = FakeSocketFactory()
+        val events = mutableListOf<SpeechEvent>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val voiced = ShortArray(1_600) { 4_000 }
+        val silence = ShortArray(1_600)
+
+        engine.start(events::add)
+        factory.open()
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_000L)
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_100L)
+        factory.listener.onText("""{"mode":"2pass-online","text":"first","is_final":false}""")
+        engine.acceptPcm(silence, silence.size, capturedAtMs = 1_600L)
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 2_000L)
+
+        factory.listener.onText("""{"mode":"2pass-offline","text":"第一句","is_final":true}""")
+        factory.listener.onText("""{"mode":"2pass-online","text":"second","is_final":false}""")
+
+        assertEquals(SpeechEvent("first", 900L, 1_100L, false), events[0])
+        assertEquals(SpeechEvent("第一句", 900L, 1_100L, true), events[1])
+        assertEquals(SpeechEvent("second", 1_900L, 2_000L, false), events[2])
+        engine.stop()
+    }
+
+    @Test
+    fun laterOnlinePartialUsesCurrentSpeechInsteadOfAnOlderUntranscribedNoiseWindow() {
+        val factory = FakeSocketFactory()
+        val events = mutableListOf<SpeechEvent>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val voiced = ShortArray(1_600) { 4_000 }
+        val silence = ShortArray(1_600)
+
+        engine.start(events::add)
+        factory.open()
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_000L)
+        engine.acceptPcm(silence, silence.size, capturedAtMs = 1_600L)
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 2_000L)
+
+        factory.listener.onText("""{"mode":"2pass-online","text":"recognized","is_final":false}""")
+
+        assertEquals(SpeechEvent("recognized", 1_900L, 2_000L, false), events.single())
+        engine.stop()
+    }
+
+    @Test
+    fun remoteTextWithoutADetectedAudioWindowHasUnreliableSourceTime() {
+        val factory = FakeSocketFactory()
+        val events = mutableListOf<SpeechEvent>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val quiet = ShortArray(1_600) { 2 }
+
+        engine.start(events::add)
+        factory.open()
+        engine.acceptPcm(quiet, quiet.size, capturedAtMs = 1_000L)
+        factory.listener.onText("""{"mode":"2pass-offline","text":"quiet speech","is_final":true}""")
+
+        assertFalse(events.single().hasReliableSourceTimestamp)
+        engine.stop()
+    }
+
+    @Test
+    fun emptyFinalResponseClearsAnUntranscribedSpeechWindow() {
+        val factory = FakeSocketFactory()
+        val events = mutableListOf<SpeechEvent>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val voiced = ShortArray(1_600) { 4_000 }
+        val silence = ShortArray(1_600)
+
+        engine.start(events::add)
+        factory.open()
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_000L)
+        engine.acceptPcm(silence, silence.size, capturedAtMs = 1_600L)
+        factory.listener.onText("""{"mode":"2pass-offline","text":"","is_final":true}""")
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 2_000L)
+        factory.listener.onText("""{"mode":"2pass-online","text":"next","is_final":false}""")
+
+        assertEquals(SpeechEvent("next", 1_900L, 2_000L, false), events.single())
+        engine.stop()
+    }
+
+    @Test
+    fun finalOnlyResponseUsesTheSinglePendingSourceWindow() {
+        val factory = FakeSocketFactory()
+        val events = mutableListOf<SpeechEvent>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val voiced = ShortArray(1_600) { 4_000 }
+        val silence = ShortArray(1_600)
+
+        engine.start(events::add)
+        factory.open()
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_000L)
+        engine.acceptPcm(silence, silence.size, capturedAtMs = 1_600L)
+        factory.listener.onText("""{"mode":"2pass-offline","text":"short phrase","is_final":true}""")
+
+        assertEquals(SpeechEvent("short phrase", 900L, 1_000L, true), events.single())
+        engine.stop()
+    }
+
+    @Test
+    fun delayedEmptyFinalConsumesAnOlderWindowWithoutClearingNewSpeech() {
+        val factory = FakeSocketFactory()
+        val events = mutableListOf<SpeechEvent>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val voiced = ShortArray(1_600) { 4_000 }
+        val silence = ShortArray(1_600)
+
+        engine.start(events::add)
+        factory.open()
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_000L)
+        engine.acceptPcm(silence, silence.size, capturedAtMs = 1_600L)
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 2_000L)
+        factory.listener.onText("""{"mode":"2pass-offline","text":"","is_final":true}""")
+        factory.listener.onText("""{"mode":"2pass-online","text":"next utterance","is_final":false}""")
+
+        assertEquals(SpeechEvent("next utterance", 1_900L, 2_000L, false), events.single())
+        engine.stop()
+    }
+
+    @Test
+    fun remoteDisconnectDuringSpeechStartsFallbackAndRoutesSubsequentPcmToIt() {
+        val factory = FakeSocketFactory()
+        val fallback = RecordingSpeechEngine()
+        val statuses = mutableListOf<String>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, fallback, statuses::add)
+        val voiced = ShortArray(1_600) { 4_000 }
+
+        engine.start {}
+        factory.open()
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_000L)
+        factory.fail(IllegalStateException("connection lost during speech"))
+        engine.acceptPcm(voiced, voiced.size, capturedAtMs = 1_100L)
+
+        assertEquals(1, fallback.startCount)
+        assertEquals(listOf(voiced.size), fallback.acceptedCounts)
+        assertTrue(factory.socket.closed)
+        assertTrue(statuses.any { it.contains("已切换本地中文后备") })
+        engine.stop()
+    }
+
     private class FakeSocketFactory : FunAsrSocketFactory {
         lateinit var listener: FunAsrSocketListener
         val socket = FakeSocket()

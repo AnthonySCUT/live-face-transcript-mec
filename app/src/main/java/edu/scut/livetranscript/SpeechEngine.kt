@@ -4,7 +4,8 @@ data class SpeechEvent(
     val text: String,
     val startedAtMs: Long,
     val endedAtMs: Long,
-    val isFinal: Boolean
+    val isFinal: Boolean,
+    val hasReliableSourceTimestamp: Boolean = true
 )
 
 interface SpeechEngine {

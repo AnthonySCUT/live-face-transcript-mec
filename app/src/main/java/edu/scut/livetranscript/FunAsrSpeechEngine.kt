@@ -71,16 +71,19 @@ class FunAsrSpeechEngine(
     private enum class State { STOPPED, CONNECTING, REMOTE, DRAINING, FALLBACK }
 
     private data class PcmFrame(val samples: ShortArray, val capturedAtMs: Long)
+    private data class SpeechWindow(val startedAtMs: Long, var endedAtMs: Long)
 
     private val lock = Any()
     private val fallbackLock = Any()
     private val pendingFrames = ArrayDeque<PcmFrame>()
+    private val speechWindows = ArrayDeque<SpeechWindow>()
     private var state = State.STOPPED
     private var callback: ((SpeechEvent) -> Unit)? = null
     private var socket: FunAsrSocket? = null
     private var fallbackStarted = false
     private var pendingSampleCount = 0
-    private var speechStartedAtMs: Long? = null
+    private var activeSpeechWindow: SpeechWindow? = null
+    private var responseSpeechWindow: SpeechWindow? = null
     private var latestCapturedAtMs = 0L
     private var previousPartial = ""
 
@@ -91,7 +94,9 @@ class FunAsrSpeechEngine(
             callback = onEvent
             pendingFrames.clear()
             pendingSampleCount = 0
-            speechStartedAtMs = null
+            speechWindows.clear()
+            activeSpeechWindow = null
+            responseSpeechWindow = null
             latestCapturedAtMs = 0L
             previousPartial = ""
             fallbackStarted = false
@@ -145,11 +150,13 @@ class FunAsrSpeechEngine(
                 shouldStopFallback = fallbackStarted
                 pendingFrames.clear()
                 pendingSampleCount = 0
-                speechStartedAtMs = null
                 previousPartial = ""
                 if (activeSocket != null) {
                     state = State.DRAINING
                 } else {
+                    speechWindows.clear()
+                    activeSpeechWindow = null
+                    responseSpeechWindow = null
                     socket = null
                     state = State.STOPPED
                     callback = null
@@ -164,6 +171,9 @@ class FunAsrSpeechEngine(
                             state = State.STOPPED
                             callback = null
                             socket = null
+                            speechWindows.clear()
+                            activeSpeechWindow = null
+                            responseSpeechWindow = null
                             true
                         }
                     }
@@ -209,32 +219,88 @@ class FunAsrSpeechEngine(
     }
 
     private fun onRemoteText(message: String) {
-        val event: SpeechEvent
-        val output: ((SpeechEvent) -> Unit)?
+        var event: SpeechEvent? = null
+        var output: ((SpeechEvent) -> Unit)? = null
         var socketToClose: FunAsrSocket? = null
         synchronized(lock) {
             if (state != State.REMOTE && state != State.DRAINING) return
-            val endAtMs = latestCapturedAtMs
-            val startAtMs = speechStartedAtMs ?: endAtMs
-            event = FunAsrProtocol.parseResponse(message, startAtMs, endAtMs) ?: return
-            if (state == State.DRAINING && !event.isFinal) return
-            if (!event.isFinal && event.text == previousPartial) return
-            if (event.isFinal) {
-                speechStartedAtMs = null
-                previousPartial = ""
+            val response = FunAsrProtocol.parseMessage(message) ?: return
+            if (state == State.DRAINING && !response.isFinal) return
+            if (response.text.isEmpty()) {
+                if (response.isFinal) consumeEmptyFinalLocked()
             } else {
-                previousPartial = event.text
+                val sourceWindow = if (response.isFinal) resolveFinalWindowLocked() else resolvePartialWindowLocked()
+                val endAtMs = sourceWindow?.endedAtMs ?: latestCapturedAtMs
+                val startAtMs = sourceWindow?.startedAtMs ?: endAtMs
+                val sourceWindowIsPending = sourceWindow != null && speechWindows.any { it === sourceWindow }
+                event = SpeechEvent(
+                    response.text,
+                    startAtMs,
+                    endAtMs,
+                    response.isFinal,
+                    hasReliableSourceTimestamp = sourceWindowIsPending &&
+                        (responseSpeechWindow === sourceWindow || speechWindows.size == 1)
+                )
+                if (!response.isFinal && response.text == previousPartial) {
+                    event = null
+                } else {
+                    if (response.isFinal) {
+                        completeSourceWindowLocked(sourceWindow ?: speechWindows.firstOrNull())
+                        previousPartial = ""
+                    } else {
+                        previousPartial = response.text
+                    }
+                    output = callback
+                }
             }
-            output = callback
-            if (state == State.DRAINING && event.isFinal) {
+            if (state == State.DRAINING && response.isFinal) {
                 state = State.STOPPED
                 callback = null
                 socketToClose = socket
                 socket = null
+                speechWindows.clear()
+                activeSpeechWindow = null
+                responseSpeechWindow = null
             }
         }
-        output?.invoke(event)
+        event?.let { output?.invoke(it) }
         socketToClose?.close()
+    }
+
+    private fun resolvePartialWindowLocked(): SpeechWindow? {
+        responseSpeechWindow?.let { return it }
+        val active = activeSpeechWindow
+        if (active != null) {
+            responseSpeechWindow = active
+            return active
+        }
+        val recentClosed = speechWindows.filter { latestCapturedAtMs - it.endedAtMs <= RECENT_CLOSED_WINDOW_MS }
+        val candidate = recentClosed.singleOrNull()
+        responseSpeechWindow = candidate
+        return candidate
+    }
+
+    private fun resolveFinalWindowLocked(): SpeechWindow? {
+        responseSpeechWindow?.takeIf { source -> speechWindows.any { it === source } }?.let { return it }
+        return speechWindows.firstOrNull()
+    }
+
+    private fun completeSourceWindowLocked(sourceWindow: SpeechWindow?) {
+        if (sourceWindow == null || speechWindows.none { it === sourceWindow }) {
+            responseSpeechWindow = null
+            return
+        }
+        while (speechWindows.isNotEmpty()) {
+            val removed = speechWindows.removeFirst()
+            if (removed === sourceWindow) break
+        }
+        if (activeSpeechWindow === sourceWindow) activeSpeechWindow = null
+        responseSpeechWindow = null
+    }
+
+    private fun consumeEmptyFinalLocked() {
+        completeSourceWindowLocked(responseSpeechWindow ?: speechWindows.firstOrNull())
+        previousPartial = ""
     }
 
     private fun switchToFallback(error: Throwable, unsentFrames: List<PcmFrame> = emptyList()) {
@@ -252,6 +318,9 @@ class FunAsrSpeechEngine(
                 }
                 pendingFrames.clear()
                 pendingSampleCount = 0
+                speechWindows.clear()
+                activeSpeechWindow = null
+                responseSpeechWindow = null
                 fallbackStarted = fallback != null
             }
             activeSocket?.close()
@@ -298,13 +367,39 @@ class FunAsrSpeechEngine(
         val rms = sqrt(energy / count)
         val levelDb = if (rms > 0.0) 20.0 * log10(rms / 32768.0) else -96.0
         val frameStartAtMs = capturedAtMs - count * 1000L / SAMPLE_RATE
-        if (levelDb >= MIN_SPEECH_DBFS && speechStartedAtMs == null) speechStartedAtMs = frameStartAtMs
+        var activeWindow = activeSpeechWindow
+        if (levelDb >= MIN_SPEECH_DBFS) {
+            if (activeWindow == null || capturedAtMs - activeWindow.endedAtMs >= SILENCE_GAP_MS) {
+                activeWindow = SpeechWindow(frameStartAtMs, capturedAtMs)
+                speechWindows.addLast(activeWindow)
+                activeSpeechWindow = activeWindow
+                while (speechWindows.size > MAX_SPEECH_WINDOWS) {
+                    val discarded = speechWindows.removeFirst()
+                    if (activeSpeechWindow === discarded) activeSpeechWindow = null
+                    if (responseSpeechWindow === discarded) responseSpeechWindow = null
+                }
+            } else {
+                activeWindow.endedAtMs = capturedAtMs
+            }
+        } else if (activeWindow != null && capturedAtMs - activeWindow.endedAtMs >= SILENCE_GAP_MS) {
+            activeSpeechWindow = null
+        }
+        while (speechWindows.isNotEmpty()) {
+            val oldest = speechWindows.first()
+            if (oldest === activeSpeechWindow || capturedAtMs - oldest.endedAtMs <= MAX_SPEECH_WINDOW_AGE_MS) break
+            speechWindows.removeFirst()
+            if (responseSpeechWindow === oldest) responseSpeechWindow = null
+        }
         latestCapturedAtMs = capturedAtMs
     }
 
     private companion object {
         const val SAMPLE_RATE = 16_000
         const val MIN_SPEECH_DBFS = -52.0
+        const val SILENCE_GAP_MS = 500L
+        const val RECENT_CLOSED_WINDOW_MS = 1_500L
+        const val MAX_SPEECH_WINDOW_AGE_MS = 30_000L
+        const val MAX_SPEECH_WINDOWS = 64
         const val MAX_PENDING_SAMPLES = SAMPLE_RATE * 3
         const val REMOTE_DRAIN_MS = 750L
     }
@@ -334,16 +429,23 @@ object FunAsrProtocol {
         return bytes
     }
 
-    fun parseResponse(message: String, startedAtMs: Long, endedAtMs: Long): SpeechEvent? {
+    data class Response(val text: String, val isFinal: Boolean)
+
+    fun parseMessage(message: String): Response? {
         return try {
             val result = JSONObject(message)
             val text = result.optString("text").trim()
-            if (text.isEmpty()) return null
             val mode = result.optString("mode")
             val isFinal = result.optBoolean("is_final", false) || mode.endsWith("offline")
-            SpeechEvent(text, startedAtMs, endedAtMs, isFinal)
+            Response(text, isFinal)
         } catch (_: Exception) {
             null
         }
+    }
+
+    fun parseResponse(message: String, startedAtMs: Long, endedAtMs: Long): SpeechEvent? {
+        val response = parseMessage(message) ?: return null
+        if (response.text.isEmpty()) return null
+        return SpeechEvent(response.text, startedAtMs, endedAtMs, response.isFinal)
     }
 }

@@ -44,11 +44,11 @@
 - Produce `interface SpeechEngine { fun start(onEvent: (SpeechEvent) -> Unit); fun acceptPcm(samples: ShortArray, count: Int, capturedAtMs: Long); fun stop() }`.
 - Vosk implementation owns its recognizer, never AudioRecord; MainActivity remains the single audio capture owner.
 
-- [ ] Write a failing unit test asserting a partial event is not final and successive final events carry ordered timestamps.
-- [ ] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.SpeechEventTest` and confirm the test fails for the missing contract.
-- [ ] Implement the contract and move only the existing Vosk recognition calls behind it; preserve the existing speech gate and local database behavior.
-- [ ] Run the same unit test and `./gradlew.bat :app:assembleDebug`; require both to pass.
-- [ ] Commit the focused files once the working directory has been connected to the verified repository history.
+- [x] Write a failing unit test asserting a partial event is not final and successive final events carry ordered timestamps.
+- [x] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.SpeechEventTest` and confirm the test fails for the missing contract.
+- [x] Implement the contract and move only the existing Vosk recognition calls behind it; preserve the existing speech gate and local database behavior.
+- [x] Run the same unit test and `./gradlew.bat :app:assembleDebug`; require both to pass.
+- [x] Commit the focused files once the working directory has been connected to the verified repository history.
 
 ### Task 2: Remote bilingual streaming candidate
 
@@ -60,15 +60,15 @@
 - Test: `app/src/test/java/edu/scut/livetranscript/FunAsrProtocolTest.kt`
 
 **Interfaces:**
-- Implement `SpeechEngine` from Task 1. Send 16 kHz mono PCM in order over one WebSocket session; map FunASR online responses to partial events and final responses to final events, retaining the originating audio time window.
+- Implement `SpeechEngine` from Task 1. Send 16 kHz mono PCM in order over one WebSocket session; map FunASR online responses to partial events and final responses to final events. Bind results to a reliable source audio window when available; otherwise speaker attribution stays unconfirmed.
 - Keep the endpoint as one development setting, not scattered constants. On connection failure, report state to the UI and switch to Vosk with an explicit `本地中文后备` label.
 
-- [ ] Write failing protocol tests for connection setup, ordered PCM chunks, partial/final mapping, and disconnect fallback.
-- [ ] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.FunAsrProtocolTest` and confirm relevant failures.
-- [ ] Add the minimal WebSocket client and remote adapter against the official FunASR streaming protocol; verify the selected model's actual response fields before fixing the parser.
-- [ ] Run the protocol tests and `:app:assembleDebug`; require both to pass.
+- [x] Write failing protocol tests for connection setup, ordered PCM chunks, partial/final mapping, active-session disconnect fallback, delayed source timestamps, and empty final responses.
+- [x] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.FunAsrProtocolTest` and confirm relevant failures.
+- [x] Add the minimal WebSocket client and remote adapter against the official FunASR streaming protocol; verify the two-pass response fields from the official server implementation.
+- [x] Run the protocol tests and `:app:assembleDebug`; require both to pass.
 - [ ] Install the APK on the emulator, then compare fixed Chinese, English, and sentence-level mixed-language samples against manual transcripts; retain the candidate only if it improves mixed-language results within the latency target.
-- [ ] Commit the focused files.
+- [x] Commit the focused files.
 
 ### Task 3: Mouth activity and speaker fusion
 
@@ -83,12 +83,12 @@
 - Produce `data class MouthSample(val trackId: Int, val atMs: Long, val activity: Float)` and `fun attribute(startedAtMs: Long, endedAtMs: Long, visibleTrackIds: Set<Int>): Int?` in `SpeakerAttributor`; null means unconfirmed.
 - MouthActivityAnalyzer uses MediaPipe face landmarks on a higher-frequency frame path, associates face bounds with existing track IDs, and passes timestamped samples to SpeakerAttributor. Keep identity recognition's current schedule initially; tune only after profiling.
 
-- [ ] Write failing fusion tests: one clear moving mouth selects its ID; similar activity, stale samples, or lost tracks return null.
-- [ ] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.SpeakerAttributorTest` and confirm failures.
-- [ ] Implement the minimal timestamp window and confidence comparison; add the landmark adapter without changing YuNet/SFace identity logic.
-- [ ] Run the fusion tests and `:app:assembleDebug`; require both to pass.
+- [x] Write failing fusion tests: one clear moving mouth selects its ID; similar activity, stale samples, or lost tracks return null.
+- [x] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.SpeakerAttributorTest` and confirm failures.
+- [x] Implement the minimal timestamp window and confidence comparison; add the landmark adapter without changing YuNet/SFace identity logic.
+- [x] Run the fusion tests and `:app:assembleDebug`; require both to pass.
 - [ ] On the emulator, measure processed frames per second and attribution against manually labeled single-speaker clips; repeat on a phone when one is available.
-- [ ] Commit the focused files.
+- [x] Commit the focused files.
 
 ### Task 4: Live UI, persistence, lifecycle, and measurements
 
@@ -99,15 +99,16 @@
 - Create: `docs/experiments/live-transcription-protocol.md`
 
 **Interfaces:**
-- Consume SpeechEvent and SpeakerAttributor. A partial event changes the preview and may revise its speaker; a final event inserts exactly one history row with the best supported label or `未确认说话人`.
+- Consume SpeechEvent and SpeakerAttributor. A partial event changes the preview and may revise its speaker; a final event inserts exactly one history row with the best supported label or `未确认说话人`. If a remote result has no reliable source-audio window, it cannot be assigned to a mouth-motion window.
 - Stop invalidates the active session token before closing audio, camera analysis, engines, and remote connection; late callbacks cannot update UI or SQLite.
 
-- [ ] Write failing tests for partial revision without persistence, one final row, unknown speaker, and ignored late callbacks.
-- [ ] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.TranscriptSessionTest` and confirm failures.
-- [ ] Connect preview and persistence to the new events and attribution, retaining the existing consent and stop behavior.
-- [ ] Run all `:app:testDebugUnitTest` tests and `:app:assembleDebug`; require both to pass.
-- [ ] Document and run a repeatable emulator protocol with fixed utterances, known speaker, first-text and text-plus-speaker latency, character/word error, attribution accuracy, network condition, and device. Repeat on a phone when one is available.
-- [ ] Commit the focused files and review the final diff for changes unrelated to this feature.
+- [x] Write failing tests for partial revision without persistence, one final row, unknown speaker, and ignored late callbacks.
+- [x] Run `./gradlew.bat :app:testDebugUnitTest --tests edu.scut.livetranscript.TranscriptSessionTest` and confirm failures.
+- [x] Connect preview and persistence to the new events and attribution, retaining the existing consent and stop behavior.
+- [x] Run all `:app:testDebugUnitTest` tests and `:app:assembleDebug`; require both to pass.
+- [x] Document a repeatable emulator protocol with fixed utterances, first-text and text-plus-speaker latency, character/word error, attribution accuracy, network condition, and device.
+- [ ] Run the protocol on an emulator and repeat on a phone when one is available.
+- [x] Commit the focused files and review the final diff for changes unrelated to this feature.
 
 ## Execution boundary
 

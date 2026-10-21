@@ -49,20 +49,46 @@ import kotlin.math.roundToInt
 class MainActivity : AppCompatActivity() {
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val mouthExecutor = Executors.newSingleThreadExecutor()
     private val processing = AtomicBoolean(false)
+    private val mouthProcessing = AtomicBoolean(false)
     private val lastFrameAt = AtomicLong(0L)
+    private val lastMouthFrameAt = AtomicLong(0L)
     private val tracker = FaceTracker()
+    private val speakerAttributor = SpeakerAttributor()
     private val store by lazy { LocalStore(this) }
+    private val transcriptSession by lazy {
+        TranscriptSession(
+            resolveSpeaker = ::resolveSpeaker,
+            onPreview = { generation, line ->
+                runOnUiThread {
+                    if (running && generation == sessionGeneration) transcriptPreview.text = "${line.speaker}：${line.text}"
+                }
+            },
+            onFinal = { generation, line ->
+                store.addUtterance(line.speaker, line.text)
+                runOnUiThread {
+                    if (generation == sessionGeneration) {
+                        refreshTranscriptList()
+                        if (running) {
+                            transcriptPreview.text = "${line.speaker}：${line.text}"
+                            speechStatus.text = "已保存到本机 · $speechEngineStatus"
+                        }
+                    }
+                }
+            }
+        )
+    }
     private val pipeline by lazy { FacePipeline(this) }
+    @Volatile private var mouthAnalyzer: MouthActivityAnalyzer? = null
+    @Volatile private var mouthAnalysisUnavailable = false
     @Volatile private var running = false
-    @Volatile private var speechDrainUntilMs = 0L
     @Volatile private var sessionGeneration = 0L
     private val speechEventLock = Any()
     @Volatile private var currentFaces: List<TrackedFace> = emptyList()
     @Volatile private var selectedTrackId: Int? = null
     @Volatile private var frameWidth = 640
     @Volatile private var frameHeight = 480
-    @Volatile private var lastSpeechSpeaker = "未确认说话人"
     @Volatile private var speechEngineStatus = "识别服务尚未启动"
     private var speechModel: Model? = null
     private var speechEngine: SpeechEngine? = null
@@ -70,8 +96,6 @@ class MainActivity : AppCompatActivity() {
     private var audioThread: Thread? = null
     @Volatile private var audioCaptureRunning = false
     private var modelLoading = false
-    private var lastCommittedSpeech = ""
-    private var lastCommittedAt = 0L
     private var pendingStart = false
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysisUseCase: ImageAnalysis? = null
@@ -203,7 +227,7 @@ class MainActivity : AppCompatActivity() {
         historyContent.addView(transcriptList.top(6))
         historyCard.addView(historyContent)
         page.addView(historyCard.top(10))
-        page.addView(label("点选人脸可指定说话人；多人同时出现且未点选时，转写归入“未确认说话人”。", 12f, 0xFF586561.toInt()).top(10))
+        page.addView(label("点击人脸用于登记身份；转写说话人根据嘴部活动判断，置信度不足时标为“未确认说话人”。", 12f, 0xFF586561.toInt()).top(10))
     }
 
     private fun onStartClicked() {
@@ -225,10 +249,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun beginSession() {
         pendingStart = false
+        lastFrameAt.set(0L)
+        lastMouthFrameAt.set(0L)
+        mouthAnalysisUnavailable = false
+        speakerAttributor.clear()
         synchronized(speechEventLock) {
             sessionGeneration++
-            speechDrainUntilMs = 0L
+            tracker.clear()
+            currentFaces = emptyList()
             running = true
+            transcriptSession.start(sessionGeneration)
         }
         startButton.text = "停止采集"
         consent.isEnabled = false
@@ -240,10 +270,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
+        val generation = sessionGeneration
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
                 val provider = future.get()
+                if (!running || generation != sessionGeneration) return@addListener
                 cameraProvider = provider
                 val previewUseCase = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
                 val analysis = ImageAnalysis.Builder()
@@ -257,42 +289,121 @@ class MainActivity : AppCompatActivity() {
                 analysisUseCase = analysis
                 status.text = "摄像头与麦克风运行中 · 未知访客编号只在本次会话有效"
             } catch (error: Exception) {
-                status.text = "摄像头启动失败：${error.localizedMessage ?: "不可用"}"
-                stopSession()
+                if (running && generation == sessionGeneration) {
+                    status.text = "摄像头启动失败：${error.localizedMessage ?: "不可用"}"
+                    stopSession()
+                }
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun analyzeFrame(image: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
-        if (!running || now - lastFrameAt.get() < FRAME_INTERVAL_MS || !processing.compareAndSet(false, true)) {
+        val generation = sessionGeneration
+        if (!running) {
             image.close()
             return
         }
-        lastFrameAt.set(now)
-        val bitmap = try { rotate(imageToBitmap(image), image.imageInfo.rotationDegrees) }
-        catch (_: Exception) { image.close(); processing.set(false); return }
-        image.close()
-        analysisExecutor.execute {
+        val runIdentity = now - lastFrameAt.get() >= FRAME_INTERVAL_MS && processing.compareAndSet(false, true)
+        val runMouth = !mouthAnalysisUnavailable && now - lastMouthFrameAt.get() >= MOUTH_FRAME_INTERVAL_MS &&
+            mouthProcessing.compareAndSet(false, true)
+        if (!runIdentity && !runMouth) {
+            image.close()
+            return
+        }
+        if (runIdentity) lastFrameAt.set(now)
+        if (runMouth) lastMouthFrameAt.set(now)
+        val bitmap = try {
+            val decoded = imageToBitmap(image)
             try {
-                val frame = downscale(bitmap, 640)
-                val samples = pipeline.detect(frame)
-                val people = store.participants()
-                val tracked = tracker.update(samples, people, SystemClock.elapsedRealtime())
-                frameWidth = frame.width
-                frameHeight = frame.height
-                currentFaces = tracked
-                runOnUiThread {
-                    overlay.submit(tracked, frame.width, frame.height)
-                    if (tracked.isEmpty()) status.text = "实时扫描中 · 当前画面未检测到人脸"
-                    else status.text = "实时扫描中 · 当前 ${tracked.size} 人 · 点击人脸可指定说话人"
+                rotate(decoded, image.imageInfo.rotationDegrees).also { rotated ->
+                    if (rotated !== decoded && !decoded.isRecycled) decoded.recycle()
                 }
-                if (frame !== bitmap) frame.recycle()
             } catch (error: Exception) {
-                runOnUiThread { status.text = "画面分析失败：${error.localizedMessage ?: "请调整光线或距离"}" }
-            } finally {
-                if (!bitmap.isRecycled) bitmap.recycle()
-                processing.set(false)
+                if (!decoded.isRecycled) decoded.recycle()
+                throw error
+            }
+        }
+        catch (_: Exception) {
+            image.close()
+            if (runIdentity) processing.set(false)
+            if (runMouth) mouthProcessing.set(false)
+            return
+        }
+        image.close()
+
+        val identityBitmap = if (runIdentity && runMouth) bitmap.copy(Bitmap.Config.ARGB_8888, false) else null
+        if (runIdentity && runMouth && identityBitmap == null) {
+            bitmap.recycle()
+            processing.set(false)
+            mouthProcessing.set(false)
+            return
+        }
+        val faceFrame = if (runIdentity) identityBitmap ?: bitmap else null
+        val mouthFrame = if (runMouth) bitmap else null
+
+        if (runIdentity) {
+            analysisExecutor.execute {
+                var frame: Bitmap? = null
+                try {
+                    if (!running || generation != sessionGeneration) return@execute
+                    val processedFrame = downscale(faceFrame!!, 640)
+                    frame = processedFrame
+                    val samples = pipeline.detect(processedFrame)
+                    if (!running || generation != sessionGeneration) return@execute
+                    val people = store.participants()
+                    val tracked = synchronized(speechEventLock) {
+                        if (!running || generation != sessionGeneration) null else {
+                            val result = tracker.update(samples, people, SystemClock.elapsedRealtime())
+                            frameWidth = processedFrame.width
+                            frameHeight = processedFrame.height
+                            currentFaces = result
+                            result
+                        }
+                    } ?: return@execute
+                    runOnUiThread {
+                        if (!running || generation != sessionGeneration) return@runOnUiThread
+                        overlay.submit(tracked, processedFrame.width, processedFrame.height)
+                        if (tracked.isEmpty()) status.text = "实时扫描中 · 当前画面未检测到人脸"
+                        else status.text = "实时扫描中 · 当前 ${tracked.size} 人 · 点击人脸可登记身份"
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread {
+                        if (running && generation == sessionGeneration) status.text = "画面分析失败：${error.localizedMessage ?: "请调整光线或距离"}"
+                    }
+                } finally {
+                    if (frame != null && frame !== faceFrame && !frame.isRecycled) frame.recycle()
+                    if (faceFrame != null && !faceFrame.isRecycled) faceFrame.recycle()
+                    processing.set(false)
+                }
+            }
+        }
+
+        if (runMouth) {
+            val trackedFaces = currentFaces.toList()
+            mouthExecutor.execute {
+                var processedFrame: Bitmap? = null
+                try {
+                    if (running && generation == sessionGeneration) {
+                        processedFrame = downscale(mouthFrame!!, 640)
+                        val analyzer = mouthAnalyzer ?: MouthActivityAnalyzer(this, speakerAttributor).also { mouthAnalyzer = it }
+                        analyzer.process(processedFrame!!, trackedFaces, now)
+                    }
+                } catch (error: Exception) {
+                    mouthAnalyzer?.close()
+                    mouthAnalyzer = null
+                    speakerAttributor.clear()
+                    if (running && generation == sessionGeneration) {
+                        mouthAnalysisUnavailable = true
+                        runOnUiThread {
+                            if (running && generation == sessionGeneration) status.text = "嘴部说话人分析不可用：${error.localizedMessage ?: "请检查模型资源"}"
+                        }
+                    }
+                } finally {
+                    processedFrame?.let { if (it !== mouthFrame && !it.isRecycled) it.recycle() }
+                    if (mouthFrame != null && !mouthFrame.isRecycled) mouthFrame.recycle()
+                    mouthProcessing.set(false)
+                }
             }
         }
     }
@@ -431,37 +542,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun onSpeechEvent(event: SpeechEvent, generation: Long) {
         synchronized(speechEventLock) {
-            if (generation != sessionGeneration) return
-            if (!running && (!event.isFinal || SystemClock.elapsedRealtime() > speechDrainUntilMs)) return
-            if (event.isFinal) {
-                commitSpeechText(event.text, generation)
-                return
-            }
-            val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
-            runOnUiThread { if (running) transcriptPreview.text = "$speaker：${event.text}" }
+            if (!running || generation != sessionGeneration) return
+            transcriptSession.accept(generation, event)
         }
     }
 
-    private fun commitSpeechText(rawText: String, generation: Long) {
-        val text = rawText.trim()
-        if (text.isEmpty()) return
-        val now = SystemClock.elapsedRealtime()
-        if (text == lastCommittedSpeech && now - lastCommittedAt < 1800L) return
-        lastCommittedSpeech = text
-        lastCommittedAt = now
-        saveUtterance(text, generation)
-    }
-
-    private fun saveUtterance(text: String, generation: Long) {
-        val speaker = tracker.speakerLabel(selectedTrackId, currentFaces)
-        lastSpeechSpeaker = speaker
-        store.addUtterance(speaker, text)
-        runOnUiThread {
-            refreshTranscriptList()
-            if (!running || generation != sessionGeneration) return@runOnUiThread
-            transcriptPreview.text = "$speaker：$text"
-            speechStatus.text = "已保存到本机 · $speechEngineStatus"
-        }
+    private fun resolveSpeaker(event: SpeechEvent): String? {
+        val visibleFaces = currentFaces
+        val trackId = speakerAttributor.attribute(
+            event,
+            visibleFaces.map { it.id }.toSet()
+        ) ?: return null
+        return visibleFaces.firstOrNull { it.id == trackId }?.label
     }
 
     private fun refreshParticipants() {
@@ -500,8 +592,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopSession() {
         synchronized(speechEventLock) {
-            speechDrainUntilMs = SystemClock.elapsedRealtime() + 2_000L
+            val stoppedGeneration = sessionGeneration
             running = false
+            sessionGeneration++
+            transcriptSession.stop(stoppedGeneration)
+            tracker.clear()
+            currentFaces = emptyList()
         }
         audioCaptureRunning = false
         val recorder = audioRecord
@@ -523,7 +619,11 @@ class MainActivity : AppCompatActivity() {
         analysisUseCase = null
         cameraProvider?.unbindAll()
         cameraProvider = null
-        currentFaces = emptyList()
+        mouthExecutor.execute {
+            mouthAnalyzer?.close()
+            mouthAnalyzer = null
+            speakerAttributor.clear()
+        }
         overlay.submit(emptyList(), frameWidth, frameHeight)
         overlay.selectedId = null
         selectedTrackId = null
@@ -535,6 +635,7 @@ class MainActivity : AppCompatActivity() {
         speechEngineStatus = "识别已停止 · 历史文本保留在本机"
         speechStatus.text = speechEngineStatus
         status.text = "摄像头与麦克风已关闭。转写文本保存在本机。"
+        refreshTranscriptList()
     }
 
     private fun imageToBitmap(image: ImageProxy): Bitmap {
@@ -601,12 +702,14 @@ class MainActivity : AppCompatActivity() {
         speechModel = null
         cameraExecutor.shutdown()
         analysisExecutor.shutdown()
+        mouthExecutor.shutdown()
         store.close()
         super.onDestroy()
     }
 
     companion object {
         private const val FRAME_INTERVAL_MS = 900L
+        private const val MOUTH_FRAME_INTERVAL_MS = 200L
         private const val AUDIO_SAMPLE_RATE = 16_000
         private const val AUDIO_BUFFER_BYTES = 6_400
         private const val AUDIO_CHUNK_SAMPLES = 1_024
