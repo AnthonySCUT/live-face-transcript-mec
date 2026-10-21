@@ -6,7 +6,6 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
-import kotlin.math.max
 
 class FaceOverlayView(context: Context) : View(context) {
     private val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -40,15 +39,13 @@ class FaceOverlayView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val scale = max(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
-        val dx = (width - imageWidth * scale) / 2f
-        val dy = (height - imageHeight * scale) / 2f
+        val transform = ImageViewportTransform.fitCenter(imageWidth, imageHeight, width, height)
         faces.forEach { face ->
             val rect = RectF(
-                dx + face.bounds.left * scale,
-                dy + face.bounds.top * scale,
-                dx + face.bounds.right * scale,
-                dy + face.bounds.bottom * scale
+                transform.mapX(face.bounds.left),
+                transform.mapY(face.bounds.top),
+                transform.mapX(face.bounds.right),
+                transform.mapY(face.bounds.bottom)
             )
             val paint = if (face.known) knownPaint else boxPaint
             canvas.drawRoundRect(rect, 8f, 8f, paint)
@@ -62,11 +59,9 @@ class FaceOverlayView(context: Context) : View(context) {
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.action != MotionEvent.ACTION_UP) return true
-        val scale = max(width.toFloat() / imageWidth, height.toFloat() / imageHeight)
-        val dx = (width - imageWidth * scale) / 2f
-        val dy = (height - imageHeight * scale) / 2f
-        val x = (event.x - dx) / scale
-        val y = (event.y - dy) / scale
+        val transform = ImageViewportTransform.fitCenter(imageWidth, imageHeight, width, height)
+        val x = transform.sourceX(event.x)
+        val y = transform.sourceY(event.y)
         val hit = faces.minByOrNull { face ->
             val centerX = face.bounds.centerX()
             val centerY = face.bounds.centerY()

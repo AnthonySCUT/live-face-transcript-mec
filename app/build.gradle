@@ -3,7 +3,7 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-def funasrWsUrl = providers.gradleProperty('funasrWsUrl').getOrElse('ws://10.0.2.2:10095')
+def funasrWsUrl = providers.gradleProperty('funasrWsUrl').getOrElse('ws://localhost:10095')
 
 android {
     namespace 'edu.scut.livetranscript'

@@ -7,12 +7,11 @@ import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAttributor) : AutoCloseable {
-    private data class PreviousMouth(val openness: Float, val atMs: Long)
+    private data class PreviousMouth(val shapes: Map<String, Float>, val atMs: Long)
 
     private val appContext = context.applicationContext
     private val landmarkerDelegate = lazy {
@@ -36,6 +35,8 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
         val input = if (bitmap.config == Bitmap.Config.ARGB_8888) bitmap
         else bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return 0
         val ownsInput = input !== bitmap
+        val inputWidth = input.width
+        val inputHeight = input.height
         try {
             val currentTrackIds = trackedFaces.map { it.id }.toSet()
             (previousMouthByTrack.keys - currentTrackIds).forEach(attributor::removeTrackSamples)
@@ -48,33 +49,39 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
             val usedTrackIds = mutableSetOf<Int>()
 
             result.faceLandmarks().forEachIndexed { faceIndex, landmarks ->
-                val jawOpen = blendshapes.getOrNull(faceIndex)
-                    ?.firstOrNull { it.categoryName() == JAW_OPEN }
-                    ?.score() ?: return@forEachIndexed
-                val faceBounds = boundsOf(landmarks, input.width, input.height) ?: return@forEachIndexed
-                val match = trackedFaces.asSequence()
+                val mouthShapes = blendshapes.getOrNull(faceIndex)
+                    ?.associate { it.categoryName() to it.score() }
+                    ?.takeIf { it.containsKey(JAW_OPEN) } ?: return@forEachIndexed
+                val faceBounds = boundsOf(landmarks, inputWidth, inputHeight) ?: return@forEachIndexed
+                val trackId = MouthTrackMatcher.selectTrack(
+                    trackedFaces.asSequence()
                     .filter { it.id !in usedTrackIds }
-                    .map { it to overlap(faceBounds, it.bounds) }
-                    .maxByOrNull { it.second }
-                    ?.takeIf { it.second >= MIN_FACE_OVERLAP }
-                    ?.first ?: return@forEachIndexed
+                    .map { it.id to overlap(faceBounds, it.bounds) }
+                    .toList(),
+                    MIN_FACE_OVERLAP,
+                    MIN_FACE_OVERLAP_MARGIN
+                ) ?: return@forEachIndexed
+                val match = trackedFaces.firstOrNull { it.id == trackId } ?: return@forEachIndexed
 
                 val previous = previousMouthByTrack[match.id]
                 val elapsed = previous?.let { atMs - it.atMs } ?: 0L
-                val activity = if (previous != null && elapsed in MIN_SAMPLE_GAP_MS..MAX_SAMPLE_GAP_MS) {
-                    abs(jawOpen - previous.openness)
-                } else {
-                    0f
+                if (previous != null && elapsed in MIN_SAMPLE_GAP_MS..MAX_SAMPLE_GAP_MS) {
+                    val activity = MouthMotionScore.activity(previous.shapes, mouthShapes)
+                    attributor.addSample(MouthSample(match.id, atMs, activity))
+                } else if (previous != null && elapsed > MAX_SAMPLE_GAP_MS) {
+                    attributor.removeTrackSamples(match.id)
                 }
-                attributor.addSample(MouthSample(match.id, atMs, activity))
-                previousMouthByTrack[match.id] = PreviousMouth(jawOpen, atMs)
+                previousMouthByTrack[match.id] = PreviousMouth(mouthShapes, atMs)
                 matchedTrackIds += match.id
                 usedTrackIds += match.id
             }
 
             (currentTrackIds - matchedTrackIds).forEach { trackId ->
-                previousMouthByTrack.remove(trackId)
-                attributor.removeTrackSamples(trackId)
+                val previous = previousMouthByTrack[trackId]
+                if (previous != null && atMs - previous.atMs > MAX_SAMPLE_GAP_MS) {
+                    previousMouthByTrack.remove(trackId)
+                    attributor.removeTrackSamples(trackId)
+                }
             }
             return matchedTrackIds.size
         } finally {
@@ -116,6 +123,7 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
         private const val JAW_OPEN = "jawOpen"
         private const val MAX_FACES = 8
         private const val MIN_FACE_OVERLAP = 0.12f
+        private const val MIN_FACE_OVERLAP_MARGIN = 0.08f
         private const val MIN_SAMPLE_GAP_MS = 80L
         private const val MAX_SAMPLE_GAP_MS = 1_000L
     }

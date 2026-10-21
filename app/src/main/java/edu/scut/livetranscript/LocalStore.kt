@@ -32,6 +32,17 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "live_transcript.
         } }
     }
 
+    @Synchronized fun renameParticipant(oldName: String, newName: String): Boolean {
+        val values = ContentValues().apply {
+            put("name", newName)
+            put("updated_at", System.currentTimeMillis())
+        }
+        return writableDatabase.update("participants", values, "name = ?", arrayOf(oldName)) > 0
+    }
+
+    @Synchronized fun deleteParticipant(name: String): Boolean =
+        writableDatabase.delete("participants", "name = ?", arrayOf(name)) > 0
+
     @Synchronized fun addUtterance(speaker: String, text: String): Utterance {
         val item = Utterance(speaker, text, System.currentTimeMillis())
         val values = ContentValues().apply {
@@ -41,11 +52,8 @@ class LocalStore(context: Context) : SQLiteOpenHelper(context, "live_transcript.
         return item
     }
 
-    @Synchronized fun recentUtterances(limit: Int = 20): List<Utterance> {
-        val rows = readableDatabase.rawQuery(
-            "SELECT speaker, text, timestamp FROM utterances ORDER BY id DESC LIMIT ?",
-            arrayOf(limit.toString())
-        )
+    @Synchronized fun recentUtterances(): List<Utterance> {
+        val rows = readableDatabase.rawQuery("SELECT speaker, text, timestamp FROM utterances ORDER BY id DESC", null)
         return rows.use { cursor -> buildList {
             while (cursor.moveToNext()) add(Utterance(cursor.getString(0), cursor.getString(1), cursor.getLong(2)))
         } }

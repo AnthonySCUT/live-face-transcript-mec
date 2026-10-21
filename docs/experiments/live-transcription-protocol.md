@@ -1,6 +1,6 @@
 # Live transcription and speaker attribution experiment
 
-This protocol measures recognition quality, response delay, and mouth based speaker attribution on the Android emulator. Run it again on a phone before treating the results as representative of real use. No measurements have been recorded yet; the configured SDK currently reports no attached ADB device.
+This protocol measures recognition quality, response delay, and mouth based speaker attribution on the Android emulator. Run it again on a phone before treating the results as representative of real use. The Lenovo emulator has been used for functional checks; record every measured run in the table below rather than inferring results from those checks.
 
 ## Test setup
 

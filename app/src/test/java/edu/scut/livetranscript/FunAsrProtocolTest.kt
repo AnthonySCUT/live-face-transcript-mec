@@ -62,6 +62,17 @@ class FunAsrProtocolTest {
     }
 
     @Test
+    fun senseVoiceLanguageAndTaskTagsAreNotShownInTranscript() {
+        val final = FunAsrProtocol.parseResponse(
+            """{"mode":"2pass-offline","text":"<|en|><|NEUTRAL|><|Speech|> Hello 你好","is_final":true}""",
+            startedAtMs = 1_000L,
+            endedAtMs = 1_600L
+        )
+
+        assertEquals(SpeechEvent("Hello 你好", 1_000L, 1_600L, true), final)
+    }
+
+    @Test
     fun connectionFailureSwitchesToLocalChineseFallbackAndFlushesQueuedPcm() {
         val factory = FakeSocketFactory()
         val fallback = RecordingSpeechEngine()

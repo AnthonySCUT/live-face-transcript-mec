@@ -153,7 +153,7 @@ class MainActivity : AppCompatActivity() {
         page.addView(liveBadge)
         preview = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-            scaleType = PreviewView.ScaleType.FILL_CENTER
+            scaleType = PreviewView.ScaleType.FIT_CENTER
             setBackgroundColor(0xFF202927.toInt())
             contentDescription = "实时摄像头预览"
         }
@@ -169,7 +169,7 @@ class MainActivity : AppCompatActivity() {
             addView(preview, FrameLayout.LayoutParams(-1, -1))
             addView(this@MainActivity.overlay, FrameLayout.LayoutParams(-1, -1))
         }
-        page.addView(card().apply { addView(cameraFrame, FrameLayout.LayoutParams(-1, -1)) }.top(12), LinearLayout.LayoutParams(-1, dp(270)))
+        page.addView(card().apply { addView(cameraFrame, FrameLayout.LayoutParams(-1, -1)) }.top(12), LinearLayout.LayoutParams(-1, dp(450)))
 
         consent = CheckBox(this).apply {
             text = "已告知参与者并取得人脸与语音识别同意"
@@ -200,8 +200,18 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { enrollSelectedFace() }
         })
         page.addView(enrollmentRow)
-        peopleStatus = label("身份库 0 人 · 本机保存", 12f, 0xFF586561.toInt()).top(2)
-        page.addView(peopleStatus)
+        val participantStatusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        peopleStatus = label("身份库 0 人 · 本机保存", 12f, 0xFF586561.toInt())
+        participantStatusRow.addView(peopleStatus, LinearLayout.LayoutParams(0, -2, 1f))
+        participantStatusRow.addView(Button(this).apply {
+            text = "管理身份"
+            isAllCaps = false
+            setOnClickListener { showParticipantManager() }
+        })
+        page.addView(participantStatusRow.top(2))
 
         val speechCard = card()
         val speechContent = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16)) }
@@ -361,9 +371,11 @@ class MainActivity : AppCompatActivity() {
                             result
                         }
                     } ?: return@execute
+                    val processedWidth = processedFrame.width
+                    val processedHeight = processedFrame.height
                     runOnUiThread {
                         if (!running || generation != sessionGeneration) return@runOnUiThread
-                        overlay.submit(tracked, processedFrame.width, processedFrame.height)
+                        overlay.submit(tracked, processedWidth, processedHeight)
                         if (tracked.isEmpty()) status.text = "实时扫描中 · 当前画面未检测到人脸"
                         else status.text = "实时扫描中 · 当前 ${tracked.size} 人 · 点击人脸可登记身份"
                     }
@@ -552,12 +564,104 @@ class MainActivity : AppCompatActivity() {
         val trackId = speakerAttributor.attribute(
             event,
             visibleFaces.map { it.id }.toSet()
-        ) ?: return null
-        return visibleFaces.firstOrNull { it.id == trackId }?.label
+        )
+        return trackId?.let { selected -> visibleFaces.firstOrNull { it.id == selected }?.label }
     }
 
     private fun refreshParticipants() {
         peopleStatus.text = "身份库 ${store.participants().size} 人 · 本机保存"
+    }
+
+    private fun showParticipantManager() {
+        if (running) {
+            status.text = "请先停止采集，再修改身份库。"
+            return
+        }
+        val participants = store.participants()
+        val rows = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("管理身份")
+            .setView(ScrollView(this).apply { addView(rows) })
+            .setPositiveButton("完成", null)
+            .create()
+        if (participants.isEmpty()) {
+            rows.addView(label("身份库为空", 14f, 0xFF586561.toInt()).top(8))
+        }
+        participants.forEach { participant ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(label(participant.name, 14f, 0xFF172321.toInt()), LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(Button(this).apply {
+                text = "改名"
+                isAllCaps = false
+                setOnClickListener {
+                    dialog.dismiss()
+                    renameParticipant(participant.name)
+                }
+            })
+            row.addView(Button(this).apply {
+                text = "删除"
+                isAllCaps = false
+                setOnClickListener {
+                    dialog.dismiss()
+                    confirmDeleteParticipant(participant.name)
+                }
+            })
+            rows.addView(row)
+        }
+        dialog.show()
+    }
+
+    private fun renameParticipant(oldName: String) {
+        val input = EditText(this).apply {
+            setSingleLine(true)
+            setText(oldName)
+            setSelection(text.length)
+            hint = "新姓名"
+        }
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("重命名身份")
+            .setView(input)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val newName = input.text.toString().trim()
+                when {
+                    newName.isBlank() -> status.text = "姓名不能为空。"
+                    store.participants().any { it.name == newName && it.name != oldName } -> status.text = "这个姓名已存在。"
+                    store.renameParticipant(oldName, newName) -> {
+                        refreshParticipants()
+                        status.text = "已将身份“$oldName”重命名为“$newName”。"
+                        dialog.dismiss()
+                    }
+                    else -> status.text = "身份不存在，未能重命名。"
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun confirmDeleteParticipant(name: String) {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("删除身份？")
+            .setMessage("将删除“$name”的人脸特征；已保存的转写记录不会改变。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("删除") { _, _ ->
+                if (store.deleteParticipant(name)) {
+                    refreshParticipants()
+                    status.text = "已删除身份“$name”。"
+                } else {
+                    status.text = "身份不存在，未能删除。"
+                }
+            }
+            .show()
     }
 
     private fun refreshTranscriptList() {
@@ -708,7 +812,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val FRAME_INTERVAL_MS = 900L
+        private const val FRAME_INTERVAL_MS = 450L
         private const val MOUTH_FRAME_INTERVAL_MS = 200L
         private const val AUDIO_SAMPLE_RATE = 16_000
         private const val AUDIO_BUFFER_BYTES = 6_400

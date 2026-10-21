@@ -37,6 +37,31 @@ class TranscriptSessionTest {
     }
 
     @Test
+    fun finalPrefixDoesNotDiscardTheLastCharactersAlreadyRecognizedInPreview() {
+        val saved = mutableListOf<TranscriptLine>()
+        val session = TranscriptSession({ "cpf" }, { _, _ -> }, { _, line -> saved.add(line) })
+        session.start(5L)
+
+        session.accept(5L, event("现在是八点了", final = false))
+        session.accept(5L, event("现在是八点", final = true))
+
+        assertEquals(TranscriptLine("cpf", "现在是八点了"), saved.single())
+    }
+
+    @Test
+    fun repeatedShortFinalAfterPreservingPreviewTailIsStillSavedOnlyOnce() {
+        val saved = mutableListOf<TranscriptLine>()
+        val session = TranscriptSession({ "cpf" }, { _, _ -> }, { _, line -> saved.add(line) })
+        session.start(6L)
+
+        session.accept(6L, event("现在是八点了", final = false))
+        session.accept(6L, event("现在是八点", final = true))
+        assertFalse(session.accept(6L, event("现在是八点", final = true)))
+
+        assertEquals(listOf(TranscriptLine("cpf", "现在是八点了")), saved)
+    }
+
+    @Test
     fun missingSpeakerEvidenceUsesUnconfirmedLabel() {
         val saved = mutableListOf<TranscriptLine>()
         val session = TranscriptSession({ null }, { _, _ -> }, { _, line -> saved.add(line) })

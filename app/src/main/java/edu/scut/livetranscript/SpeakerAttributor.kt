@@ -1,11 +1,12 @@
 package edu.scut.livetranscript
 
 import java.util.ArrayDeque
+import kotlin.math.min
 
 data class MouthSample(val trackId: Int, val atMs: Long, val activity: Float)
 
 class SpeakerAttributor {
-    private data class Score(val trackId: Int, val activity: Float)
+    private data class Score(val trackId: Int, val activity: Float, val activeSampleCount: Int)
 
     private val samples = ArrayDeque<MouthSample>()
     private var latestSampleAtMs = Long.MIN_VALUE
@@ -26,21 +27,33 @@ class SpeakerAttributor {
     @Synchronized
     fun attribute(startedAtMs: Long, endedAtMs: Long, visibleTrackIds: Set<Int>): Int? {
         if (endedAtMs < startedAtMs || visibleTrackIds.isEmpty()) return null
-        val windowStart = startedAtMs - PRE_SPEECH_MS
+        val windowStart = maxOf(startedAtMs - PRE_SPEECH_MS, endedAtMs - RECENT_ATTRIBUTION_TAIL_MS)
         val byTrack = samples.asSequence()
             .filter { it.trackId in visibleTrackIds && it.atMs in windowStart..endedAtMs }
             .groupBy { it.trackId }
+        val multiFace = visibleTrackIds.size > 1
         val scores = visibleTrackIds.mapNotNull { trackId ->
             val values = byTrack[trackId].orEmpty()
-            if (values.size < MIN_EVIDENCE_SAMPLES) null
-            else Score(trackId, values.map { it.activity }.average().toFloat())
+            if (multiFace) {
+                val active = values.map { it.activity }.filter { it >= MULTI_FACE_ACTIVE_SAMPLE }
+                Score(trackId, active.fold(0f) { total, sample -> total + min(sample, MAX_MULTI_SAMPLE_ACTIVITY) }, active.size)
+            } else {
+                values.takeIf { it.isNotEmpty() }
+                    ?.let { Score(trackId, it.maxOf { sample -> sample.activity }, it.size) }
+            }
         }
-        if (scores.isEmpty() || (visibleTrackIds.size > 1 && scores.size != visibleTrackIds.size)) return null
+        if (scores.isEmpty()) return null
 
-        val ranked = scores.sortedByDescending { it.activity }
+        val ranked = scores
+            .filter { !multiFace || it.activeSampleCount >= MULTI_FACE_MIN_ACTIVE_SAMPLES }
+            .sortedByDescending { it.activity }
+        if (ranked.isEmpty()) return null
         val best = ranked.first()
         val runnerUp = ranked.getOrNull(1)?.activity ?: 0f
-        if (best.activity < MIN_ACTIVITY || best.activity - runnerUp < MIN_MARGIN) return null
+        val minimumActivity = if (multiFace) MIN_ACTIVITY else SINGLE_FACE_MIN_ACTIVITY
+        if (best.activity < minimumActivity) return null
+        val requiredMargin = min(MIN_MARGIN, best.activity * MIN_MARGIN_RATIO)
+        if (multiFace && best.activity - runnerUp < requiredMargin) return null
         if (runnerUp > 0f && best.activity < runnerUp * MIN_RATIO) return null
         return best.trackId
     }
@@ -66,9 +79,14 @@ class SpeakerAttributor {
         const val MAX_HISTORY_MS = 10_000L
         const val MAX_SAMPLE_COUNT = 512
         const val PRE_SPEECH_MS = 150L
-        const val MIN_EVIDENCE_SAMPLES = 2
-        const val MIN_ACTIVITY = 0.035f
+        const val MIN_ACTIVITY = 0.003f
+        const val SINGLE_FACE_MIN_ACTIVITY = 0.003f
+        const val MULTI_FACE_ACTIVE_SAMPLE = 0.003f
+        const val MULTI_FACE_MIN_ACTIVE_SAMPLES = 1
+        const val MAX_MULTI_SAMPLE_ACTIVITY = 0.04f
         const val MIN_MARGIN = 0.025f
+        const val MIN_MARGIN_RATIO = 0.75f
         const val MIN_RATIO = 1.5f
+        const val RECENT_ATTRIBUTION_TAIL_MS = 1_000L
     }
 }

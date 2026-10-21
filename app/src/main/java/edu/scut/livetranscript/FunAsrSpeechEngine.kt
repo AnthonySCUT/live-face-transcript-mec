@@ -406,6 +406,8 @@ class FunAsrSpeechEngine(
 }
 
 object FunAsrProtocol {
+    private val SENSEVOICE_TAG_REGEX = Regex("<\\|[^|]+\\|>")
+
     fun startMessage(sessionId: String): String = JSONObject()
         .put("mode", "2pass")
         .put("wav_name", sessionId)
@@ -434,7 +436,7 @@ object FunAsrProtocol {
     fun parseMessage(message: String): Response? {
         return try {
             val result = JSONObject(message)
-            val text = result.optString("text").trim()
+            val text = result.optString("text").replace(SENSEVOICE_TAG_REGEX, "").trim()
             val mode = result.optString("mode")
             val isFinal = result.optBoolean("is_final", false) || mode.endsWith("offline")
             Response(text, isFinal)
