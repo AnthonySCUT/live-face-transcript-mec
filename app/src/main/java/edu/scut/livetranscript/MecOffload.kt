@@ -115,7 +115,7 @@ class MecOffload(private val context: Context, private val pipeline: FacePipelin
         }
         val total = elapsed(start)
         val result = MecResult(samples, mode, total, detect, align, feature, remote, network, sent, received, cpuLoad)
-        scheduler.observe(mode, Profile(max(0.0, total - network), remote, sent, received, cpuLoad))
+        scheduler.observe(mode, Profile(max(0.0, total - network - remote), remote, sent, received, cpuLoad))
         return result
     }
 

@@ -54,6 +54,9 @@ def process_aligned(data):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
     def do_GET(self):
         if self.path == "/health":
             self.reply({"status": "ok", "opencv": cv2.__version__})
