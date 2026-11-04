@@ -3,7 +3,7 @@
 **汇报日期：** 2026 年 11 月 4 日  
 **课程：**《软件体系结构》综合项目  
 **项目方向：** 移动边缘计算中的人脸流水线静态切分与运行时动态卸载  
-**代码基线：** `feature/mec-offloading`，提交 `e5cb14d`  
+**代码基线：** `feature/mec-offloading`，报告已提交至 `27027aa`（MEC 功能基线 `e5cb14d`）
 **项目仓库：** [live-face-transcript-mec](https://github.com/AnthonySCUT/live-face-transcript-mec/tree/feature/mec-offloading)
 
 ## 一、项目简介
