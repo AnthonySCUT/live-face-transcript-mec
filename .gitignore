@@ -1,6 +1,9 @@
 local.properties
 .gradle/
 .kotlin/
+.venv/
+__pycache__/
+*.pyc
 **/build/
 .idea/
 *.iml

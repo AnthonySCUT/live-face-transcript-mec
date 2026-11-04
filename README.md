@@ -10,6 +10,7 @@
 - **实时中英混合转写**：16 kHz 单声道麦克风 PCM 流发送至 FunASR WebSocket。临时结果实时显示，最终结果连同时间和说话人标签保存在本机。
 - **离线后备**：FunASR 不可用时自动切换到本机 Vosk 中文识别；界面会明确提示后备状态。该后备不支持可靠的中英混合识别。
 - **视觉说话人归属**：MediaPipe Face Landmarker 根据发声末段可见人脸的 `jawOpen` 变化，将文本关联到最有证据的说话人；证据不足或多人运动相近时显示“未确认说话人”。
+- **MEC 计算切分**：支持手机本地、检测对齐后把人脸小图发至电脑、整帧发至电脑，以及基于网络和性能剖析的动态切换。支持输入尺寸、上行限速、实验 CSV 导出与样例实验；操作及指标定义见 [端云实验指南](docs/experiments/mec-partitioning.md)。
 - **隐私边界**：应用不保存原始音频；身份库与转写历史仅保存在设备本机。FunASR 模式会把实时音频流发送到配置的识别服务。
 
 多人归属是基于嘴部可见运动的视觉判断，不包含声纹识别，也不分离同时发言的人声。约 2 秒的文字和说话人显示延迟是待真机实验验证的目标，不是已宣称的性能数据。
@@ -63,7 +64,7 @@ $adb = Join-Path $androidSdk 'platform-tools\adb.exe'
 .\gradlew.bat :app:assembleDebug -PfunasrWsUrl=ws://192.168.1.10:10095
 ```
 
-当前网络安全配置只为 `localhost` 和 `10.0.2.2` 允许明文 `ws://`。外部服务应优先使用 `wss://`；若必须使用其他明文内网地址，需显式修改 `app/src/main/res/xml/network_security_config.xml`，不要全局放开明文流量。
+当前网络配置支持内网明文 HTTP/WebSocket，供手机连接电脑上的 MEC 和 FunASR 服务。
 
 ## 安装和启动
 

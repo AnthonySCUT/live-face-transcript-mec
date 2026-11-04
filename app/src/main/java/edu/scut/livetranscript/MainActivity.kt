@@ -21,6 +21,10 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Spinner
+import android.widget.ArrayAdapter
+import android.widget.AdapterView
+import androidx.core.widget.doAfterTextChanged
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -80,6 +84,12 @@ class MainActivity : AppCompatActivity() {
         )
     }
     private val pipeline by lazy { FacePipeline(this) }
+    private val mec by lazy { MecOffload(this, pipeline) }
+    @Volatile private var mecMode = "本地"
+    @Volatile private var mecUrl = "http://10.0.2.2:8000"
+    @Volatile private var mecSize = 640
+    @Volatile private var mecLimit = 0
+    @Volatile private var mecReset = false
     @Volatile private var mouthAnalyzer: MouthActivityAnalyzer? = null
     @Volatile private var mouthAnalysisUnavailable = false
     @Volatile private var running = false
@@ -110,6 +120,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var transcriptList: LinearLayout
     private lateinit var nameInput: EditText
     private lateinit var liveBadge: TextView
+    private lateinit var mecStatus: TextView
+    private val exportMetrics = registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        if (uri != null && mec.logFile.exists()) contentResolver.openOutputStream(uri)?.use { output -> mec.logFile.inputStream().use { it.copyTo(output) } }
+    }
 
     private val requestPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         val granted = result[Manifest.permission.CAMERA] == true && result[Manifest.permission.RECORD_AUDIO] == true
@@ -128,6 +142,7 @@ class MainActivity : AppCompatActivity() {
         buildScreen()
         refreshParticipants()
         refreshTranscriptList()
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("mecBenchmark", false)) runSampleBenchmark()
     }
 
     private fun buildScreen() {
@@ -186,6 +201,29 @@ class MainActivity : AppCompatActivity() {
         status = label("点击开始后会同时启动摄像头与麦克风。", 12f, 0xFF586561.toInt()).top(3)
         page.addView(status)
 
+        page.addView(label("计算切分实验", 16f, 0xFF172321.toInt(), true).top(12))
+        fun options(items: List<String>, selected: (String) -> Unit): Spinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { selected(items[position]); mecReset = true }
+            }
+        }
+        page.addView(options(listOf("本地", "对齐后卸载", "整帧卸载", "动态")) { mecMode = it })
+        page.addView(EditText(this).apply {
+            setSingleLine(true); textSize = 14f; hint = "电脑服务地址"
+            setText(mecUrl)
+            doAfterTextChanged { mecUrl = it.toString().trim().trimEnd('/'); mecReset = true }
+        })
+        page.addView(label("输入图像最大边长", 12f, 0xFF586561.toInt()))
+        page.addView(options(listOf("640", "480", "320")) { mecSize = it.toInt() })
+        page.addView(label("上行限速（实验模拟）", 12f, 0xFF586561.toInt()))
+        page.addView(options(listOf("不限速", "512 kbps", "2000 kbps", "10000 kbps")) { mecLimit = it.substringBefore(' ').toIntOrNull() ?: 0 })
+        mecStatus = label("等待采样", 12f, 0xFF586561.toInt())
+        page.addView(mecStatus)
+        page.addView(Button(this).apply { text = "导出实验 CSV"; isAllCaps = false; setOnClickListener { exportMetrics.launch("mec-experiments.csv") } })
+        page.addView(Button(this).apply { text = "运行样例切分实验"; isAllCaps = false; setOnClickListener { runSampleBenchmark() } })
+
         page.addView(label("参与者登记", 16f, 0xFF172321.toInt(), true).top(12))
         val enrollmentRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         nameInput = EditText(this).apply {
@@ -238,6 +276,42 @@ class MainActivity : AppCompatActivity() {
         historyCard.addView(historyContent)
         page.addView(historyCard.top(10))
         page.addView(label("点击人脸用于登记身份；转写说话人根据嘴部活动判断，置信度不足时标为“未确认说话人”。", 12f, 0xFF586561.toInt()).top(10))
+    }
+
+    private fun runSampleBenchmark() {
+        val endpoint = mecUrl
+        mecStatus.text = "样例实验正在运行：不同切分点、图像尺寸与上行限速"
+        analysisExecutor.execute {
+            try {
+                val original = assets.open("test/lena.jpg").use { BitmapFactory.decodeStream(it) }
+                var count = 0
+                try {
+                    for (size in listOf(320, 640)) {
+                        val frame = downscale(original, size)
+                        try {
+                            for (limit in listOf(0, 512)) {
+                                for (mode in listOf("本地", "对齐后卸载", "整帧卸载")) {
+                                    val started = SystemClock.elapsedRealtime()
+                                    val result = mec.run(frame, mode, endpoint, limit)
+                                    mec.log(result, "样例_$mode", frame.width, frame.height, limit, (SystemClock.elapsedRealtime() - started).toDouble(), 0.0)
+                                    count++
+                                }
+                                mec.reset()
+                                repeat(4) {
+                                    val started = SystemClock.elapsedRealtime()
+                                    val result = mec.run(frame, "动态", endpoint, limit)
+                                    mec.log(result, "样例_动态", frame.width, frame.height, limit, (SystemClock.elapsedRealtime() - started).toDouble(), 0.0)
+                                    count++
+                                }
+                            }
+                        } finally { if (frame !== original) frame.recycle() }
+                    }
+                } finally { original.recycle() }
+                runOnUiThread { mecStatus.text = "样例实验完成：$count 条记录，可导出 CSV" }
+            } catch (error: Exception) {
+                runOnUiThread { mecStatus.text = "样例实验失败：${error.localizedMessage}" }
+            }
+        }
     }
 
     private fun onStartClicked() {
@@ -357,25 +431,40 @@ class MainActivity : AppCompatActivity() {
                 var frame: Bitmap? = null
                 try {
                     if (!running || generation != sessionGeneration) return@execute
-                    val processedFrame = downscale(faceFrame!!, 640)
+                    val processedFrame = downscale(faceFrame!!, mecSize)
                     frame = processedFrame
-                    val samples = pipeline.detect(processedFrame)
+                    if (mecReset) { mec.reset(); mecReset = false }
+                    val requested = mecMode
+                    val metrics = try { mec.run(processedFrame, requested, mecUrl, mecLimit) }
+                    catch (error: java.io.IOException) {
+                        if (requested != "动态") throw error
+                        mec.run(processedFrame, "本地", mecUrl, mecLimit)
+                    }
+                    val canonicalScale = minOf(1f, 640f / maxOf(faceFrame.width, faceFrame.height)) * faceFrame.width / processedFrame.width
+                    val samples = metrics.samples.map { sample ->
+                        val b = sample.bounds
+                        FaceSample(android.graphics.RectF(b.left * canonicalScale, b.top * canonicalScale, b.right * canonicalScale, b.bottom * canonicalScale), sample.embedding)
+                    }
                     if (!running || generation != sessionGeneration) return@execute
                     val people = store.participants()
+                    val trackerStart = SystemClock.elapsedRealtimeNanos()
                     val tracked = synchronized(speechEventLock) {
                         if (!running || generation != sessionGeneration) null else {
                             val result = tracker.update(samples, people, SystemClock.elapsedRealtime())
-                            frameWidth = processedFrame.width
-                            frameHeight = processedFrame.height
+                            frameWidth = (processedFrame.width * canonicalScale).roundToInt()
+                            frameHeight = (processedFrame.height * canonicalScale).roundToInt()
                             currentFaces = result
                             result
                         }
                     } ?: return@execute
-                    val processedWidth = processedFrame.width
-                    val processedHeight = processedFrame.height
+                    val trackerMs = (SystemClock.elapsedRealtimeNanos() - trackerStart) / 1_000_000.0
+                    mec.log(metrics, requested, processedFrame.width, processedFrame.height, mecLimit, (SystemClock.elapsedRealtime() - now).toDouble(), trackerMs)
+                    val processedWidth = frameWidth
+                    val processedHeight = frameHeight
                     runOnUiThread {
                         if (!running || generation != sessionGeneration) return@runOnUiThread
                         overlay.submit(tracked, processedWidth, processedHeight)
+                        mecStatus.text = "${metrics.mode} · ${metrics.totalMs.roundToInt()} ms · 上行 ${metrics.sent} B · 下行 ${metrics.received} B · CPU ${"%.2f".format(metrics.cpuLoad)} 核"
                         if (tracked.isEmpty()) status.text = "实时扫描中 · 当前画面未检测到人脸"
                         else status.text = "实时扫描中 · 当前 ${tracked.size} 人 · 点击人脸可登记身份"
                     }
