@@ -259,6 +259,18 @@ class FunAsrProtocolTest {
         engine.stop()
     }
 
+    @Test
+    fun fileEndFlushesLocalFallback() {
+        val factory = FakeSocketFactory()
+        val fallback = RecordingSpeechEngine()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, fallback)
+        engine.start {}
+        factory.fail(IllegalStateException("offline"))
+        engine.finishInput()
+        assertEquals(1, fallback.finishCount)
+        engine.stop()
+    }
+
     private class FakeSocketFactory : FunAsrSocketFactory {
         lateinit var listener: FunAsrSocketListener
         val socket = FakeSocket()
@@ -292,6 +304,7 @@ class FunAsrProtocolTest {
 
     private class RecordingSpeechEngine : SpeechEngine {
         var startCount = 0
+        var finishCount = 0
         val acceptedCounts = mutableListOf<Int>()
 
         override fun start(onEvent: (SpeechEvent) -> Unit) {
@@ -302,6 +315,7 @@ class FunAsrProtocolTest {
             acceptedCounts += count
         }
 
+        override fun finishInput() { finishCount++ }
         override fun stop() = Unit
     }
 }

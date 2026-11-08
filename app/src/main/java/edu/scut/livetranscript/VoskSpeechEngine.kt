@@ -14,6 +14,7 @@ class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
     private var speechStartedAtMs: Long? = null
     private var previousPartial = ""
     private var started = false
+    private var lastCapturedAtMs = 0L
 
     override fun start(onEvent: (SpeechEvent) -> Unit) {
         this.onEvent = onEvent
@@ -37,6 +38,7 @@ class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
             speechStartedAtMs = chunkStartedAtMs
         }
 
+        lastCapturedAtMs = capturedAtMs
         val output = decoder.acceptPcm(samples, count)
         val speechStart = speechStartedAtMs ?: return
         val text = output.text.trim()
@@ -48,6 +50,18 @@ class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
             previousPartial = text
             onEvent?.invoke(SpeechEvent(text, speechStart, capturedAtMs, false))
         }
+    }
+
+    override fun finishInput() {
+        if (!started) return
+        val output = decoder.finish()
+        val start = speechStartedAtMs
+        if (start != null && output != null && output.text.isNotBlank()) {
+            onEvent?.invoke(SpeechEvent(output.text.trim(), start, lastCapturedAtMs, true,
+                speakerVector = output.speakerVector, speakerFrames = output.speakerFrames))
+        }
+        speechStartedAtMs = null
+        previousPartial = ""
     }
 
     override fun stop() {
@@ -72,6 +86,12 @@ class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
             } else {
                 DecoderOutput(isFinal = false, text = JSONObject(recognizer.partialResult).optString("partial"))
             }
+        }
+
+        override fun finish(): DecoderOutput {
+            val result = JSONObject(recognizer.finalResult)
+            val vector = result.optJSONArray("spk")?.let { array -> List(array.length()) { array.getDouble(it).toFloat() } }
+            return DecoderOutput(true, result.optString("text"), vector, result.optInt("spk_frames"))
         }
 
         override fun close() = recognizer.close()

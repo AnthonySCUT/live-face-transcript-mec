@@ -13,6 +13,7 @@ data class SpeechEvent(
 interface SpeechEngine {
     fun start(onEvent: (SpeechEvent) -> Unit)
     fun acceptPcm(samples: ShortArray, count: Int, capturedAtMs: Long)
+    fun finishInput() = stop()
     fun stop()
 }
 
@@ -20,5 +21,6 @@ data class DecoderOutput(val isFinal: Boolean, val text: String, val speakerVect
 
 interface SpeechDecoder {
     fun acceptPcm(samples: ShortArray, count: Int): DecoderOutput
+    fun finish(): DecoderOutput? = null
     fun close()
 }

@@ -58,6 +58,27 @@ class SpeechEventTest {
         assertEquals(1, events.size)
     }
 
+    @Test
+    fun endOfFileFlushesLastUtteranceOnlyOnce() {
+        var closed = false
+        val decoder = object : SpeechDecoder {
+            override fun acceptPcm(samples: ShortArray, count: Int) = DecoderOutput(false, "last words")
+            override fun finish() = DecoderOutput(true, "last words")
+            override fun close() { closed = true }
+        }
+        val engine = VoskSpeechEngine(decoder)
+        val events = mutableListOf<SpeechEvent>()
+        engine.start(events::add)
+        engine.acceptPcm(speechChunk(), 1600, 1100L)
+        engine.finishInput()
+        engine.finishInput()
+        assertEquals(1, events.count { it.isFinal })
+        assertEquals("last words", events.last().text)
+        assertEquals(1100L, events.last().endedAtMs)
+        engine.stop()
+        assertTrue(closed)
+    }
+
     private fun speechChunk() = ShortArray(1600) { 5000 }
 
     private class FakeSpeechDecoder(outputs: List<DecoderOutput>) : SpeechDecoder {

@@ -108,6 +108,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var voiceprintEnabled: CheckBox
     @Volatile private var voiceprintActive = false
     @Volatile private var enrollVoiceprintName: String? = null
+    private val pickTestVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null && !running && !modelLoading) {
+            startActivity(android.content.Intent(this, VideoTestActivity::class.java).apply {
+                data = uri
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                putExtra("speechMode", selectedSpeechMode.name)
+                putExtra("mecMode", mecMode); putExtra("mecUrl", mecUrl)
+                putExtra("mecSize", mecSize); putExtra("mecLimit", mecLimit)
+            })
+        }
+    }
     private var importKind = "english"
     private val importModel = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null && !running && !modelLoading) {
@@ -326,6 +337,14 @@ class MainActivity : AppCompatActivity() {
         speechContent.addView(speechStatus)
         speechCard.addView(speechContent)
         page.addView(speechCard.top(12))
+        page.addView(Button(this).apply {
+            text = "导入视频测试（使用当前人脸与语音设置）"
+            setOnClickListener {
+                if (running || modelLoading) status.text = "请先停止采集并等待模型加载结束"
+                else if (!consent.isChecked) status.text = "请先确认视频参与者已同意用于识别测试"
+                else pickTestVideo.launch(arrayOf("video/*"))
+            }
+        })
 
         val historyCard = card()
         val historyContent = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16)) }

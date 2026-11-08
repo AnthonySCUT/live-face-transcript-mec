@@ -140,6 +140,11 @@ class FunAsrSpeechEngine(
         }
     }
 
+    override fun finishInput() {
+        val local = synchronized(lock) { state == State.FALLBACK }
+        if (local) synchronized(fallbackLock) { fallback?.finishInput() } else stop()
+    }
+
     override fun stop() {
         synchronized(fallbackLock) {
             val activeSocket: FunAsrSocket?
