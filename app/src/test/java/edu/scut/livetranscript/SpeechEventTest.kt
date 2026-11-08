@@ -43,6 +43,21 @@ class SpeechEventTest {
         assertTrue(events.isEmpty())
     }
 
+    @Test
+    fun finalEventCarriesSpeakerEvidenceWithoutChangingTiming() {
+        val vector = List(128) { if (it == 0) 1f else 0f }
+        val engine = VoskSpeechEngine(FakeSpeechDecoder(listOf(DecoderOutput(true, "hello", vector, 350))))
+        val events = mutableListOf<SpeechEvent>()
+        engine.start(events::add)
+        engine.acceptPcm(speechChunk(), 1600, 1100L)
+        assertEquals(vector, events.single().speakerVector)
+        assertEquals(350, events.single().speakerFrames)
+        assertEquals(1000L, events.single().startedAtMs)
+        engine.stop()
+        engine.acceptPcm(speechChunk(), 1600, 1200L)
+        assertEquals(1, events.size)
+    }
+
     private fun speechChunk() = ShortArray(1600) { 5000 }
 
     private class FakeSpeechDecoder(outputs: List<DecoderOutput>) : SpeechDecoder {

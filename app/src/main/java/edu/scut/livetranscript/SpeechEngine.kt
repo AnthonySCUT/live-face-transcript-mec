@@ -5,7 +5,9 @@ data class SpeechEvent(
     val startedAtMs: Long,
     val endedAtMs: Long,
     val isFinal: Boolean,
-    val hasReliableSourceTimestamp: Boolean = true
+    val hasReliableSourceTimestamp: Boolean = true,
+    val speakerVector: List<Float>? = null,
+    val speakerFrames: Int = 0
 )
 
 interface SpeechEngine {
@@ -14,7 +16,7 @@ interface SpeechEngine {
     fun stop()
 }
 
-data class DecoderOutput(val isFinal: Boolean, val text: String)
+data class DecoderOutput(val isFinal: Boolean, val text: String, val speakerVector: List<Float>? = null, val speakerFrames: Int = 0)
 
 interface SpeechDecoder {
     fun acceptPcm(samples: ShortArray, count: Int): DecoderOutput

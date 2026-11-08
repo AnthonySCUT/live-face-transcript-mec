@@ -39,6 +39,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.setPadding
 import com.google.android.material.card.MaterialCardView
 import org.opencv.android.OpenCVLoader
+import org.vosk.SpeakerModel
 import org.vosk.Model
 import org.vosk.android.StorageService
 import java.io.ByteArrayOutputStream
@@ -101,6 +102,31 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var frameHeight = 480
     @Volatile private var speechEngineStatus = "识别服务尚未启动"
     private var speechModel: Model? = null
+    private var speakerModel: SpeakerModel? = null
+    private var selectedSpeechMode = SpeechMode.REMOTE
+    private var activeSpeechMode = SpeechMode.REMOTE
+    private lateinit var voiceprintEnabled: CheckBox
+    @Volatile private var voiceprintActive = false
+    @Volatile private var enrollVoiceprintName: String? = null
+    private var importKind = "english"
+    private val importModel = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null && !running && !modelLoading) {
+            modelLoading = true
+            val kind = getPreferences(MODE_PRIVATE).getString("modelImportKind", importKind) ?: importKind
+            Thread {
+                val result = runCatching {
+                    contentResolver.openInputStream(uri).use { input ->
+                        requireNotNull(input)
+                        ModelArchive.install(input, java.io.File(filesDir, "imported-models"), kind)
+                    }
+                }
+                runOnUiThread {
+                    modelLoading = false
+                    speechStatus.text = result.fold({ "模型导入成功，下次开始采集时生效" }, { "模型导入失败：${it.message}" })
+                }
+            }.start()
+        }
+    }
     private var speechEngine: SpeechEngine? = null
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
@@ -139,6 +165,7 @@ class MainActivity : AppCompatActivity() {
             setContentView(TextView(this).apply { text = "OpenCV 初始化失败"; setPadding(32) })
             return
         }
+        selectedSpeechMode = SpeechMode.entries.firstOrNull { it.name == getPreferences(MODE_PRIVATE).getString("speechMode", null) } ?: SpeechMode.REMOTE
         buildScreen()
         refreshParticipants()
         refreshTranscriptList()
@@ -151,7 +178,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(18))
             setBackgroundColor(0xFFF4F6F5.toInt())
         }
-        val scroll = ScrollView(this).apply { addView(page) }
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = true; isScrollbarFadingEnabled = false; addView(page) }
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(0, bars.top, 0, bars.bottom)
@@ -254,6 +281,45 @@ class MainActivity : AppCompatActivity() {
         val speechCard = card()
         val speechContent = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16)) }
         speechContent.addView(label("实时转写", 16f, 0xFF172321.toInt(), true))
+        speechContent.addView(label("语音位置（下次开始采集生效）", 12f, 0xFF586561.toInt()))
+        speechContent.addView(Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, SpeechMode.entries.map { it.title })
+            setSelection(selectedSpeechMode.ordinal)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { selectedSpeechMode = SpeechMode.entries[position]; getPreferences(MODE_PRIVATE).edit().putString("speechMode", selectedSpeechMode.name).apply() }
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
+        })
+        listOf("english" to "导入英文 Vosk 模型 ZIP", "speaker" to "导入 Vosk 声纹模型 ZIP").forEach { (kind, title) ->
+            speechContent.addView(Button(this).apply {
+                text = title
+                setOnClickListener {
+                    if (running || modelLoading) speechStatus.text = "请停止采集并等待模型加载结束后导入"
+                    else { importKind = kind; getPreferences(MODE_PRIVATE).edit().putString("modelImportKind", kind).apply(); importModel.launch(arrayOf("application/zip", "application/octet-stream", "application/x-zip-compressed")) }
+                }
+            })
+        }
+        voiceprintEnabled = CheckBox(this).apply { text = "实验声纹辅助（仅本地语音，需导入声纹模型）" }
+        speechContent.addView(voiceprintEnabled)
+        speechContent.addView(Button(this).apply {
+            text = "为选中身份录入下一句声纹"
+            setOnClickListener {
+                val name = currentFaces.firstOrNull { it.id == selectedTrackId }?.label
+                if (!running || !audioCaptureRunning || !voiceprintActive || name == null || store.participants().none { it.name == name }) {
+                    speechStatus.text = "请开启本地声纹辅助，开始采集并点选已登记的人脸"
+                } else androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle("录入 $name 的声纹？")
+                    .setMessage("确认本人同意保存声纹后，请仅由本人清晰说一句至少数秒的话。下一条有效最终结果将覆盖该身份声纹，仅存本机。")
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("本人同意并录入") { _, _ -> enrollVoiceprintName = name; speechStatus.text = "等待 $name 的下一句有效语音" }.show()
+            }
+        })
+        speechContent.addView(Button(this).apply {
+            text = "清除全部声纹"
+            setOnClickListener { androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                .setMessage("清除本机全部声纹？人脸身份和字幕保留。")
+                .setNegativeButton("取消", null).setPositiveButton("清除") { _, _ -> synchronized(speechEventLock) { enrollVoiceprintName = null; store.clearVoiceprints() } }.show() }
+        })
         transcriptPreview = label("等待语音…", 15f, 0xFF176B62.toInt()).top(8)
         speechContent.addView(transcriptPreview)
         speechStatus = label("识别服务尚未启动", 12f, 0xFF586561.toInt()).top(5)
@@ -332,6 +398,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun beginSession() {
+        if (modelLoading) { status.text = "请等待模型加载或导入结束"; return }
+        activeSpeechMode = selectedSpeechMode
+        voiceprintActive = voiceprintEnabled.isChecked && activeSpeechMode != SpeechMode.REMOTE
+        enrollVoiceprintName = null
         pendingStart = false
         lastFrameAt.set(0L)
         lastMouthFrameAt.set(0L)
@@ -522,39 +592,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSpeechRecognition() {
-        if (audioCaptureRunning) {
-            speechStatus.text = "实时语音识别运行中"
-            return
-        }
-        if (modelLoading) {
-            speechStatus.text = "正在加载本地中文后备模型…"
-            return
-        }
+        val generation = sessionGeneration
+        val mode = activeSpeechMode
         modelLoading = true
-        speechEngineStatus = "正在加载本地中文后备模型…"
+        speechEngineStatus = "正在加载${mode.title}模型…"
         speechStatus.text = speechEngineStatus
-        StorageService.unpack(
-            this,
-            "models/vosk-model-small-cn-0.22",
-            "vosk",
-            { model ->
-                modelLoading = false
-                speechModel = model
-                if (running) startFunAsrRecognition(VoskSpeechEngine(model), sessionGeneration)
-            },
-            { error ->
-                modelLoading = false
-                speechEngineStatus = "本地中文后备加载失败：${error.message ?: "未知错误"}"
-                runOnUiThread { if (running) speechStatus.text = speechEngineStatus }
-                if (running) startFunAsrRecognition(null, sessionGeneration)
-            }
-        )
+        fun loaded(model: Model) {
+            modelLoading = false
+            if (!running || generation != sessionGeneration || isDestroyed) { model.close(); return }
+            speechModel?.close()
+            speechModel = model
+            try {
+                speakerModel?.close()
+                speakerModel = null
+                if (voiceprintActive) {
+                    val dir = java.io.File(filesDir, "imported-models/speaker")
+                    check(dir.isDirectory) { "请先导入 Vosk 声纹模型 ZIP" }
+                    speakerModel = SpeakerModel(dir.absolutePath)
+                }
+                val local = VoskSpeechEngine(model, speakerModel)
+                speechEngineStatus = if (mode == SpeechMode.REMOTE) "电脑端中英（本地中文后备）" else mode.title
+                startFunAsrRecognition(local, generation)
+            } catch (error: Exception) { speechStatus.text = "模型启动失败：${error.message}" }
+        }
+        fun failed(error: Exception) {
+            modelLoading = false
+            if (!running || generation != sessionGeneration || isDestroyed) return
+            speechEngineStatus = "模型加载失败：${error.message}"
+            speechStatus.text = speechEngineStatus
+            if (mode == SpeechMode.REMOTE) startFunAsrRecognition(null, generation)
+        }
+        if (mode == SpeechMode.LOCAL_ENGLISH) {
+            Thread {
+                try {
+                    val dir = java.io.File(filesDir, "imported-models/english")
+                    check(dir.isDirectory) { "请先导入 vosk-model-small-en-us-0.15.zip" }
+                    val model = Model(dir.absolutePath)
+                    runOnUiThread { loaded(model) }
+                } catch (error: Exception) { runOnUiThread { failed(error) } }
+            }.start()
+        } else StorageService.unpack(this, "models/vosk-model-small-cn-0.22", "vosk", { loaded(it) }, { failed(it) })
     }
 
     private fun startFunAsrRecognition(localFallback: SpeechEngine?, generation: Long) {
         if (!running || generation != sessionGeneration || audioCaptureRunning) return
         try {
-            val engine = FunAsrSpeechEngine(
+            val engine = if (activeSpeechMode != SpeechMode.REMOTE) requireNotNull(localFallback) else FunAsrSpeechEngine(
                 endpoint = BuildConfig.FUNASR_WS_URL,
                 fallback = localFallback,
                 onStatus = { message ->
@@ -572,6 +655,7 @@ class MainActivity : AppCompatActivity() {
                 AudioFormat.ENCODING_PCM_16BIT
             )
             check(minBuffer > 0) { "Android 无法创建 16 kHz 麦克风流（$minBuffer）" }
+            check(ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "需要麦克风权限" }
             val recorder = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 AUDIO_SAMPLE_RATE,
@@ -650,11 +734,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun resolveSpeaker(event: SpeechEvent): String? {
         val visibleFaces = currentFaces
-        val trackId = speakerAttributor.attribute(
-            event,
-            visibleFaces.map { it.id }.toSet()
-        )
-        return trackId?.let { selected -> visibleFaces.firstOrNull { it.id == selected }?.label }
+        val visualId = speakerAttributor.attribute(event, visibleFaces.map { it.id }.toSet())
+        val visualName = visualId?.let { id -> visibleFaces.firstOrNull { it.id == id }?.label }
+        val vector = event.speakerVector?.toFloatArray()
+        if (voiceprintActive && event.isFinal && enrollVoiceprintName != null &&
+            (event.speakerFrames < 300 || vector == null || !VoiceprintMatcher.valid(vector))) {
+            speechEngineStatus = "声纹样本不足，请仅由录入者继续清晰说数秒并停顿"
+        }
+        if (voiceprintActive && event.isFinal && event.speakerFrames >= 300 && vector != null && VoiceprintMatcher.valid(vector)) {
+            val enrollment = enrollVoiceprintName
+            if (enrollment != null) {
+                enrollVoiceprintName = null
+                if (store.participants().any { it.name == enrollment }) {
+                    store.saveVoiceprint(enrollment, vector)
+                    speechEngineStatus = "已在本机录入 $enrollment 的声纹 · ${activeSpeechMode.title}"
+                    return enrollment
+                }
+            }
+            val matched = VoiceprintMatcher.match(vector, store.voiceprints())
+            if (matched != null) return if (visualName == null || visualName == matched) matched else null
+        }
+        return visualName
     }
 
     private fun refreshParticipants() {
@@ -766,6 +866,21 @@ class MainActivity : AppCompatActivity() {
             val item = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(7), 0, dp(7)) }
             item.addView(label("${formatter.format(Date(row.timestamp))} · ${row.speaker}", 11f, 0xFF176B62.toInt(), true))
             item.addView(label(row.text, 14f, 0xFF172321.toInt()).top(2))
+            item.contentDescription = "编辑 ${row.speaker} 的字幕：${row.text}"
+            item.setOnClickListener {
+                val input = EditText(this).apply { setText(row.text); minLines = 2 }
+                val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+                    .setTitle("修改已保存字幕").setView(input)
+                    .setNegativeButton("取消", null).setPositiveButton("保存", null).create()
+                dialog.setOnShowListener {
+                    dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        if (input.text.isNullOrBlank()) input.error = "字幕不能为空"
+                        else if (store.updateUtterance(row.id, input.text.toString())) { refreshTranscriptList(); dialog.dismiss() }
+                        else input.error = "记录已被删除，请取消并刷新"
+                    }
+                }
+                dialog.show()
+            }
             transcriptList.addView(item)
         }
     }
@@ -784,6 +899,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopSession() {
+        enrollVoiceprintName = null
         synchronized(speechEventLock) {
             val stoppedGeneration = sessionGeneration
             running = false
@@ -893,6 +1009,8 @@ class MainActivity : AppCompatActivity() {
         if (::overlay.isInitialized) stopSession()
         speechModel?.close()
         speechModel = null
+        speakerModel?.close()
+        speakerModel = null
         cameraExecutor.shutdown()
         analysisExecutor.shutdown()
         mouthExecutor.shutdown()

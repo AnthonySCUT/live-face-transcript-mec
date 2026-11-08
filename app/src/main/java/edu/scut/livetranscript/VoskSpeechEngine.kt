@@ -1,13 +1,14 @@
 package edu.scut.livetranscript
 
 import org.json.JSONObject
+import org.vosk.SpeakerModel
 import org.vosk.Model
 import org.vosk.Recognizer
 import kotlin.math.log10
 import kotlin.math.sqrt
 
 class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
-    constructor(model: Model) : this(VoskDecoder(model))
+    constructor(model: Model, speakerModel: SpeakerModel? = null) : this(VoskDecoder(model, speakerModel))
 
     private var onEvent: ((SpeechEvent) -> Unit)? = null
     private var speechStartedAtMs: Long? = null
@@ -40,7 +41,7 @@ class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
         val speechStart = speechStartedAtMs ?: return
         val text = output.text.trim()
         if (output.isFinal) {
-            if (text.isNotEmpty()) onEvent?.invoke(SpeechEvent(text, speechStart, capturedAtMs, true))
+            if (text.isNotEmpty()) onEvent?.invoke(SpeechEvent(text, speechStart, capturedAtMs, true, speakerVector = output.speakerVector, speakerFrames = output.speakerFrames))
             speechStartedAtMs = null
             previousPartial = ""
         } else if (text.isNotEmpty() && text != previousPartial) {
@@ -58,12 +59,16 @@ class VoskSpeechEngine(private val decoder: SpeechDecoder) : SpeechEngine {
         decoder.close()
     }
 
-    private class VoskDecoder(model: Model) : SpeechDecoder {
-        private val recognizer = Recognizer(model, AUDIO_SAMPLE_RATE.toFloat())
+    private class VoskDecoder(model: Model, speakerModel: SpeakerModel?) : SpeechDecoder {
+        private val recognizer = Recognizer(model, AUDIO_SAMPLE_RATE.toFloat()).apply {
+            if (speakerModel != null) setSpeakerModel(speakerModel)
+        }
 
         override fun acceptPcm(samples: ShortArray, count: Int): DecoderOutput {
             return if (recognizer.acceptWaveForm(samples, count)) {
-                DecoderOutput(isFinal = true, text = JSONObject(recognizer.result).optString("text"))
+                val result = JSONObject(recognizer.result)
+                val vector = result.optJSONArray("spk")?.let { array -> List(array.length()) { array.getDouble(it).toFloat() } }
+                DecoderOutput(true, result.optString("text"), vector, result.optInt("spk_frames"))
             } else {
                 DecoderOutput(isFinal = false, text = JSONObject(recognizer.partialResult).optString("partial"))
             }
