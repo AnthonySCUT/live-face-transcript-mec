@@ -75,22 +75,23 @@ $asrPython = 'server\.venv-asr\Scripts\python.exe'
 
 RTX 5060 使用 CUDA 12.8 推理。首次启动会从 ModelScope 与 Hugging Face 下载 FunASR、VAD、SepFormer 权重；加载完成后服务开始监听。启动日志保存在 `server\artifacts\logs`。关闭服务用 `& .\server\stop_local_services.ps1`。
 
-模拟器重启后，需要把 `10095` 端口反向转发到电脑：
+### 手机一键连接电脑服务
 
-### 联想模拟器或 USB 设备连接本机服务
+在项目根目录双击 `打开手机连接助手.bat`，然后点击“启动服务并连接手机”。连接手机需要一根支持数据传输的 USB 线，并在手机中开启 USB 调试；首次连接时解锁手机并确认 RSA 授权。助手会启动/复用人脸 MEC、FunASR 和双人分离服务，为 `8000`、`8001`、`10095` 建立 ADB USB 反向转发，按设备 ABI 安装 APK 并打开应用。应用自动选用 USB 转发地址并检查三项服务。
 
-模拟器已经连接时执行：
+实体手机通过 `127.0.0.1` 访问反向转发端口；模拟器继续使用 `10.0.2.2` 访问电脑端人脸和分离服务。数据通过 USB 传输，因此手机与电脑不必在同一 Wi-Fi，VPN 的 IP 路由也不参与这条连接路径。电脑端需要已配置好仓库中的 Python 环境和模型；首次模型下载期间等待服务启动完成。
 
-```powershell
-$androidSdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
-$adb = Join-Path $androidSdk 'platform-tools\adb.exe'
-& $adb devices -l
-& $adb reverse tcp:10095 tcp:10095
-```
+若改用 Wi-Fi 直连，电脑和手机需要有互相可达的局域网地址，应用连接地址可在实验区的三个服务地址栏修改。VPN 网络策略、路由隔离、设备未授权或 USB 线仅支持充电时，连接助手会在窗口日志中给出检测结果和对应处理步骤。
 
-应用默认以 `10.0.2.2:8000` 和 `10.0.2.2:8001` 访问模拟器宿主机；`localhost:10095` 通过上面的 `adb reverse` 连接 FunASR。实体手机用 USB 调试时，同样可使用 `adb reverse tcp:10095 tcp:10095`，MEC 地址填电脑局域网 IPv4，例如 `http://192.168.1.10:8000` 和 `http://192.168.1.10:8001/separate-and-transcribe`。也可将 FunASR 地址填写为 `ws://192.168.1.10:10095`。
+## 手机硬件约束实验
 
-“远端服务不可用”表示 WebSocket 尚未连上 `10095`：常见情况是服务未启动、模型仍在加载尚未开始监听、模拟器重启后没有恢复 `adb reverse`，或自定义服务地址/端口不匹配。恢复服务和转发后，停止并重新开始采集以建立新的 FunASR 会话；当前会话会继续使用启动时选择的后备引擎。
+运行 `scripts\Start-MobileProfileEmulator.ps1` 可用同一 `MEC_API_35` AVD 启动可复现的受限配置：2 个 guest CPU 核、2048 MB RAM、SwiftShader 软件图形渲染，并保留 AVD 用户数据。Android Emulator 官方支持用 `-cores`、`-memory` 和 `-gpu software` 选择这些配置；软件渲染后可在 `dumpsys SurfaceFlinger` 中核对 `Google SwiftShader`。[Emulator 命令行选项](https://developer.android.com/studio/run/emulator-commandline) · [图形加速配置](https://developer.android.com/studio/run/emulator-acceleration)
+
+该 AVD 的 CPU frequency driver 记录为 `dummy`，frequency min/max 字段记录为 `1/2`；实验将其作为模拟器报告值保存，并把可控 CPU 约束明确记为 2 个 guest 核。`-gpu software` 使用 SwiftShader 屏幕渲染；本次图形配置按软件渲染记录。当前本地推理路径为 OpenCV YuNet/SFace、默认 CPU delegate 的 MediaPipe FaceLandmarker 和 Vosk；实验记录这一 CPU 推理配置。实时摄像头身份分析的帧间隔为 450 ms，嘴部分析为 200 ms。AVD 的 NNAPI 服务列为 `nnapi-sample_*`，硬件 NPU 性能数据在 VIVO X200 Pro 实机采集。NNAPI 已在 Android 15 弃用，Android 官方推荐新模型使用 TensorFlow Lite GPU runtime 等更新路径。[NNAPI 文档](https://developer.android.com/ndk/guides/neuralnetworks) · [NNAPI 迁移指南](https://developer.android.com/ndk/guides/neuralnetworks/migration-guide)
+
+手机 GPU/NPU 与真实 CPU 频率的数据在 VIVO X200 Pro 实机上运行同一 APK 采集；当前 AVD 报告记录 vCPU、RAM、软件图形渲染、frequency driver 值和应用帧率约束。
+
+“远端服务不可用”表示 WebSocket 尚未连上 `10095`：服务未启动、模型仍在加载、USB 转发未建立，或服务地址/端口不匹配都会触发该状态。重新打开桌面连接助手并检查应用中的“电脑服务连接”状态；随后停止并重新开始采集以建立新的 FunASR 会话。
 
 如果团队使用其他服务地址，可在构建时覆盖：
 

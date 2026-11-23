@@ -8,6 +8,8 @@
 - 最低 API 26，目标/编译 API 35，JDK 17，Gradle 8.9。
 - 已实现本机多脸检测、SFace 身份匹配、会话内陌生人编号、身份重命名/删除、本机 SQLite 转写历史。
 - 默认语音模式是电脑端 FunASR 中英混合识别；可切换到手机本地中英双模型、中文单模型或英文单模型。电脑端使用 `ws://localhost:10095` 两遍流式识别，Paraformer 提供实时草稿，SenseVoiceSmall 输出完整句并补充标点；已登记姓名作为热词上下文。电脑端不可用时会切回本地中英双模型。
+- `打开手机连接助手.bat` 提供 Windows 一键服务启动、ADB USB 端口反向转发、按 ABI 安装和打开应用；手机端自动识别模拟器/实体机地址，并检查人脸、FunASR、双人分离服务。USB 调试须已授权。
+- `scripts/Start-MobileProfileEmulator.ps1` 用 2 guest CPU 核、2048 MB 和 SwiftShader 软件渲染复现手机资源压力；AVD CPU frequency driver 为 `dummy`，实机 GPU/NPU/CPU 频率测量需在 VIVO 上执行。
 - 说话人归属综合人脸、嘴部活动和本地声纹；检测到同步嘴部活动时，电脑端 SepFormer 分成两路并发调用两个 FunASR 会话，手机端逐路匹配声纹与嘴部活动，未登记者使用陌生人编号。
 - 内置单人英语、双人同步发言、脸部遮挡、出画与重入视频/WAV；固定素材由 Part B/C 回放、同源语音对照和边界诊断按钮使用。
 - 摄像头使用 `FIT_CENTER` 显示完整预览画面；点按已保存转写可编辑并覆盖文字。
@@ -19,6 +21,9 @@
 | 位置 | 职责 |
 | --- | --- |
 | `app/src/main/java/edu/scut/livetranscript/MainActivity.kt` | 界面、权限、CameraX、AudioRecord、识别引擎切换、结果保存 |
+| `app/src/main/java/edu/scut/livetranscript/HostConnectionConfig.kt` | 模拟器/实体机服务地址选择与连接探测 |
+| `ConnectPhoneAssistant.ps1` / `ConnectPhoneWorker.ps1` | Windows 连接助手界面与服务/ADB/安装工作流 |
+| `scripts/Start-MobileProfileEmulator.ps1` | 受限 AVD 硬件 profile 与设备参数采样 |
 | `FacePipeline.kt` / `FaceTracker.kt` | YuNet/SFace 人脸检测、特征提取、跨帧跟踪与身份匹配 |
 | `FaceOverlayView.kt` / `ImageViewportTransform.kt` | 预览框、标签和坐标映射 |
 | `MouthActivityAnalyzer.kt` / `MouthTrackMatcher.kt` / `MouthMotionScore.kt` | MediaPipe 嘴部分析、人脸轨道匹配与 `jawOpen` 活动分数 |

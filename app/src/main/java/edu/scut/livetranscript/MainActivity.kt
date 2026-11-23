@@ -14,6 +14,7 @@ import android.media.MediaMetadataRetriever
 import android.util.Base64
 import android.util.Log
 import android.os.Bundle
+import android.os.Build
 import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
@@ -66,6 +67,7 @@ class MainActivity : AppCompatActivity() {
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val mouthExecutor = Executors.newSingleThreadExecutor()
     private val overlapExecutor = Executors.newSingleThreadExecutor()
+    private val connectionExecutor = Executors.newSingleThreadExecutor()
     private val processing = AtomicBoolean(false)
     private val mouthProcessing = AtomicBoolean(false)
     private val lastFrameAt = AtomicLong(0L)
@@ -106,9 +108,13 @@ class MainActivity : AppCompatActivity() {
     private val replayLog by lazy { ReplayExperimentLog(this) }
     @Volatile private var mecMode = "本地"
     @Volatile private var speechMode = "电脑端中英"
-    @Volatile private var mecUrl = "http://10.0.2.2:8000"
-    @Volatile private var funasrUrl = BuildConfig.FUNASR_WS_URL
-    @Volatile private var overlapUrl = "http://10.0.2.2:8001/separate-and-transcribe"
+    private val defaultConnectionAddresses by lazy {
+        HostConnectionConfig.defaults(isEmulator(), BuildConfig.FUNASR_WS_URL)
+    }
+    private val connectionPreferences by lazy { getSharedPreferences("computer_connection", MODE_PRIVATE) }
+    @Volatile private var mecUrl = defaultConnectionAddresses.faceBaseUrl
+    @Volatile private var funasrUrl = defaultConnectionAddresses.funAsrWsUrl
+    @Volatile private var overlapUrl = defaultConnectionAddresses.overlapUrl
     @Volatile private var mecSize = 640
     @Volatile private var mecLimit = 0
     @Volatile private var mecReset = false
@@ -146,6 +152,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var liveBadge: TextView
     private lateinit var mecStatus: TextView
     private lateinit var replayStatus: TextView
+    private lateinit var connectionStatus: TextView
+    private lateinit var mecUrlInput: EditText
+    private lateinit var funasrUrlInput: EditText
+    private lateinit var overlapUrlInput: EditText
     private val exportMetrics = registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
         if (uri != null && mec.logFile.exists()) contentResolver.openOutputStream(uri)?.use { output -> mec.logFile.inputStream().use { it.copyTo(output) } }
     }
@@ -170,9 +180,12 @@ class MainActivity : AppCompatActivity() {
             setContentView(TextView(this).apply { text = "OpenCV 初始化失败"; setPadding(32) })
             return
         }
+        loadConnectionSettings()
         buildScreen()
         refreshParticipants()
         refreshTranscriptList()
+        if (intent.getBooleanExtra("connectComputer", false)) connectToComputer()
+        else checkComputerConnection()
         if (BuildConfig.DEBUG && intent.getBooleanExtra("mecBenchmark", false)) runSampleBenchmark()
         if (BuildConfig.DEBUG && intent.getBooleanExtra("videoBenchmark", false)) runVideoReplayBenchmark()
         if (BuildConfig.DEBUG && intent.getBooleanExtra("edgeBenchmark", false)) runEdgeCaseReplay()
@@ -243,6 +256,15 @@ class MainActivity : AppCompatActivity() {
         status = label("点击开始后会同时启动摄像头与麦克风。", 12f, 0xFF586561.toInt()).top(3)
         page.addView(status)
 
+        page.addView(label("电脑服务连接", 16f, 0xFF172321.toInt(), true).top(12))
+        connectionStatus = label("正在检查电脑端服务…", 12f, 0xFF586561.toInt()).top(3)
+        page.addView(connectionStatus)
+        page.addView(Button(this).apply {
+            text = "自动配置并测试电脑连接"
+            isAllCaps = false
+            setOnClickListener { connectToComputer() }
+        }.top(3))
+
         page.addView(label("计算切分实验", 16f, 0xFF172321.toInt(), true).top(12))
         fun options(items: List<String>, selected: (String) -> Unit): Spinner = Spinner(this).apply {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
@@ -255,23 +277,26 @@ class MainActivity : AppCompatActivity() {
         page.addView(label("语音识别位置（停止采集后切换）", 12f, 0xFF586561.toInt()))
         page.addView(options(listOf("电脑端中英", "本地中英", "本地中文", "本地英文")) { speechMode = it })
         page.addView(label("人脸 MEC HTTP 服务地址", 12f, 0xFF586561.toInt()))
-        page.addView(EditText(this).apply {
+        mecUrlInput = EditText(this).apply {
             setSingleLine(true); textSize = 14f; hint = "人脸服务，例如 http://10.0.2.2:8000"
             setText(mecUrl)
-            doAfterTextChanged { mecUrl = it.toString().trim().trimEnd('/'); mecReset = true }
-        })
+            doAfterTextChanged { mecUrl = it.toString().trim().trimEnd('/'); mecReset = true; saveConnectionSettings() }
+        }
+        page.addView(mecUrlInput)
         page.addView(label("电脑端 FunASR WebSocket 地址", 12f, 0xFF586561.toInt()))
-        page.addView(EditText(this).apply {
+        funasrUrlInput = EditText(this).apply {
             setSingleLine(true); textSize = 14f; hint = "模拟器用 localhost；手机填电脑局域网 IP"
             setText(funasrUrl)
-            doAfterTextChanged { funasrUrl = it.toString().trim() }
-        })
+            doAfterTextChanged { funasrUrl = it.toString().trim(); saveConnectionSettings() }
+        }
+        page.addView(funasrUrlInput)
         page.addView(label("双人重叠分离服务地址", 12f, 0xFF586561.toInt()))
-        page.addView(EditText(this).apply {
+        overlapUrlInput = EditText(this).apply {
             setSingleLine(true); textSize = 14f; hint = "例如 http://10.0.2.2:8001/separate-and-transcribe"
             setText(overlapUrl)
-            doAfterTextChanged { overlapUrl = it.toString().trim() }
-        })
+            doAfterTextChanged { overlapUrl = it.toString().trim(); saveConnectionSettings() }
+        }
+        page.addView(overlapUrlInput)
         page.addView(label("输入图像最大边长", 12f, 0xFF586561.toInt()))
         page.addView(options(listOf("640", "480", "320")) { mecSize = it.toInt() })
         page.addView(label("上行限速（实验模拟）", 12f, 0xFF586561.toInt()))
@@ -822,6 +847,56 @@ class MainActivity : AppCompatActivity() {
             resultText, elapsedMs.toDouble(), firstResultAt.get().takeIf { it > 0L }?.toDouble(),
             status.get(), transfer?.transferMetrics() ?: SpeechTransferMetrics(0, 0)
         )
+    }
+
+    private fun isEmulator() = HostConnectionConfig.isEmulator(Build.FINGERPRINT, Build.MODEL, Build.PRODUCT)
+
+    private fun loadConnectionSettings() {
+        val defaults = defaultConnectionAddresses
+        mecUrl = connectionPreferences.getString("face", defaults.faceBaseUrl) ?: defaults.faceBaseUrl
+        funasrUrl = connectionPreferences.getString("funasr", defaults.funAsrWsUrl) ?: defaults.funAsrWsUrl
+        overlapUrl = connectionPreferences.getString("overlap", defaults.overlapUrl) ?: defaults.overlapUrl
+    }
+
+    private fun saveConnectionSettings() {
+        connectionPreferences.edit()
+            .putString("face", mecUrl)
+            .putString("funasr", funasrUrl)
+            .putString("overlap", overlapUrl)
+            .apply()
+    }
+
+    private fun connectToComputer() {
+        if (running) {
+            connectionStatus.text = "请先停止采集，再切换电脑连接地址。"
+            return
+        }
+        val preferred = defaultConnectionAddresses
+        mecUrl = preferred.faceBaseUrl
+        funasrUrl = preferred.funAsrWsUrl
+        overlapUrl = preferred.overlapUrl
+        mecUrlInput.setText(mecUrl)
+        funasrUrlInput.setText(funasrUrl)
+        overlapUrlInput.setText(overlapUrl)
+        saveConnectionSettings()
+        checkComputerConnection()
+    }
+
+    private fun checkComputerConnection() {
+        val face = mecUrl
+        val speech = funasrUrl
+        val overlap = overlapUrl
+        connectionStatus.text = "正在检查人脸、语音和双人分离服务…"
+        connectionExecutor.execute {
+            val result = HostConnectionProbe.check(face, speech, overlap)
+            runOnUiThread {
+                connectionStatus.text = if (result.allReady) {
+                    "电脑服务已连接：${result.summary()}"
+                } else {
+                    "${result.summary()}。USB连接请打开桌面连接助手并接受手机上的 USB 调试授权。"
+                }
+            }
+        }
     }
 
     private fun onStartClicked() {
