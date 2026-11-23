@@ -53,7 +53,8 @@ class PartitionScheduler {
 }
 
 data class MecResult(val samples: List<FaceSample>, val mode: Partition, val totalMs: Double, val detectMs: Double,
-    val alignMs: Double, val featureMs: Double, val remoteMs: Double, val networkMs: Double, val sent: Int, val received: Int, val cpuLoad: Double)
+    val alignMs: Double, val featureMs: Double, val remoteMs: Double, val networkMs: Double, val sent: Int, val received: Int,
+    val cpuLoad: Double, val probe: NetworkProbe)
 
 class MecOffload(private val context: Context, private val pipeline: FacePipeline) {
     private val scheduler = PartitionScheduler()
@@ -65,12 +66,12 @@ class MecOffload(private val context: Context, private val pipeline: FacePipelin
     val logFile = File(context.filesDir, "mec-experiments.csv")
 
     fun reset() { scheduler.clear(); lastProbeAt = 0L; probe = NetworkProbe(0.0, 0.0, 0.0) }
-    fun run(bitmap: Bitmap, requested: String, endpoint: String, limitKbps: Int): MecResult {
+    fun run(bitmap: Bitmap, requested: String, endpoint: String, limitKbps: Int, forceProbe: Boolean = false): MecResult {
         val wall = SystemClock.elapsedRealtime()
         val cpu = Process.getElapsedCpuTime()
         cpuLoad = ((cpu - cpuAt).toDouble() / max(1L, wall - wallAt)).coerceIn(0.0, 4.0)
         cpuAt = cpu; wallAt = wall
-        if (requested == "动态" && wall - lastProbeAt > 15_000L) {
+        if (requested == "动态" && (forceProbe || wall - lastProbeAt > 15_000L)) {
             probe = measureNetwork(endpoint, limitKbps)
             lastProbeAt = SystemClock.elapsedRealtime()
         }
@@ -114,7 +115,7 @@ class MecOffload(private val context: Context, private val pipeline: FacePipelin
             }
         }
         val total = elapsed(start)
-        val result = MecResult(samples, mode, total, detect, align, feature, remote, network, sent, received, cpuLoad)
+        val result = MecResult(samples, mode, total, detect, align, feature, remote, network, sent, received, cpuLoad, probe)
         scheduler.observe(mode, Profile(max(0.0, total - network - remote), remote, sent, received, cpuLoad))
         return result
     }

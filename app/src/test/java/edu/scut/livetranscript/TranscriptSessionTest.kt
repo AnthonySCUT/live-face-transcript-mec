@@ -37,28 +37,45 @@ class TranscriptSessionTest {
     }
 
     @Test
-    fun finalPrefixDoesNotDiscardTheLastCharactersAlreadyRecognizedInPreview() {
+    fun storesBothSeparatedSpeakersWhenTheyProduceTheSameTextAndTimestamps() {
         val saved = mutableListOf<TranscriptLine>()
-        val session = TranscriptSession({ "cpf" }, { _, _ -> }, { _, line -> saved.add(line) })
-        session.start(5L)
+        val session = TranscriptSession({ "未确认说话人" }, { _, _ -> }, { _, line -> saved.add(line) })
+        val event = event("Hello", final = true)
+        session.start(7L)
 
-        session.accept(5L, event("现在是八点了", final = false))
-        session.accept(5L, event("现在是八点", final = true))
+        assertTrue(session.accept(7L, event, "登记用户"))
+        assertTrue(session.accept(7L, event, "陌生人 A"))
 
-        assertEquals(TranscriptLine("cpf", "现在是八点了"), saved.single())
+        assertEquals(listOf(TranscriptLine("登记用户", "Hello"), TranscriptLine("陌生人 A", "Hello")), saved)
     }
 
     @Test
-    fun repeatedShortFinalAfterPreservingPreviewTailIsStillSavedOnlyOnce() {
+    fun finalResultOverwritesAnIncorrectPartialWithTheContextualCorrection() {
+        val previews = mutableListOf<TranscriptLine>()
+        val saved = mutableListOf<TranscriptLine>()
+        val session = TranscriptSession({ "cpf" }, { _, line -> previews.add(line) }, { _, line -> saved.add(line) })
+        session.start(5L)
+
+        session.accept(5L, event("明天三点开会", final = false))
+        session.accept(5L, event("明天下午三点开会，地点在实验室。", final = true))
+
+        val correction = TranscriptLine("cpf", "明天下午三点开会，地点在实验室。")
+        assertEquals(correction, previews.last())
+        assertEquals(correction, saved.single())
+    }
+
+    @Test
+    fun repeatedCorrectedFinalIsStillSavedOnlyOnce() {
         val saved = mutableListOf<TranscriptLine>()
         val session = TranscriptSession({ "cpf" }, { _, _ -> }, { _, line -> saved.add(line) })
         session.start(6L)
 
-        session.accept(6L, event("现在是八点了", final = false))
-        session.accept(6L, event("现在是八点", final = true))
-        assertFalse(session.accept(6L, event("现在是八点", final = true)))
+        session.accept(6L, event("明天三点开会", final = false))
+        val final = event("明天下午三点开会，地点在实验室。", final = true)
+        session.accept(6L, final)
+        assertFalse(session.accept(6L, final))
 
-        assertEquals(listOf(TranscriptLine("cpf", "现在是八点了")), saved)
+        assertEquals(listOf(TranscriptLine("cpf", "明天下午三点开会，地点在实验室。")), saved)
     }
 
     @Test

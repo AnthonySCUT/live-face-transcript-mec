@@ -28,7 +28,13 @@ class FaceOverlayView(context: Context) : View(context) {
     private var imageWidth = 1
     private var imageHeight = 1
     var selectedId: Int? = null
+    private var activeSpeakerIds: Set<Int> = emptySet()
     var onFaceSelected: ((Int) -> Unit)? = null
+
+    fun setActiveSpeakerIds(ids: Set<Int>) {
+        activeSpeakerIds = ids
+        invalidate()
+    }
 
     fun submit(faces: List<TrackedFace>, sourceWidth: Int, sourceHeight: Int) {
         this.faces = faces
@@ -49,7 +55,11 @@ class FaceOverlayView(context: Context) : View(context) {
             )
             val paint = if (face.known) knownPaint else boxPaint
             canvas.drawRoundRect(rect, 8f, 8f, paint)
-            val title = if (face.id == selectedId) "${face.label} · 说话人" else face.label
+            val title = when {
+                face.id in activeSpeakerIds -> "${face.label} · 正在说话"
+                face.id == selectedId -> "${face.label} · 已选择"
+                else -> face.label
+            }
             val textWidth = labelPaint.measureText(title)
             val chip = RectF(rect.left, (rect.top - 30f * resources.displayMetrics.density).coerceAtLeast(0f), rect.left + textWidth + 20f, rect.top)
             canvas.drawRoundRect(chip, 6f, 6f, chipPaint)

@@ -1,6 +1,7 @@
 package edu.scut.livetranscript
 
 import java.util.ArrayDeque
+import kotlin.math.sqrt
 import kotlin.math.min
 
 data class MouthSample(val trackId: Int, val atMs: Long, val activity: Float)
@@ -65,9 +66,95 @@ class SpeakerAttributor {
     }
 
     @Synchronized
+    fun overlappingTracks(event: SpeechEvent, visibleTrackIds: Set<Int>): Set<Int> {
+        if (!event.hasReliableSourceTimestamp || visibleTrackIds.size < 2 || event.endedAtMs < event.startedAtMs) return emptySet()
+        val windowStart = event.startedAtMs - PRE_SPEECH_MS
+        val active = samples.filter {
+            it.trackId in visibleTrackIds && it.atMs in windowStart..event.endedAtMs && it.activity >= MULTI_FACE_ACTIVE_SAMPLE
+        }
+        val overlapping = mutableSetOf<Int>()
+        for (first in active.indices) for (second in first + 1 until active.size) {
+            val a = active[first]
+            val b = active[second]
+            if (a.trackId != b.trackId && kotlin.math.abs(a.atMs - b.atMs) <= OVERLAP_WINDOW_MS) {
+                overlapping += a.trackId
+                overlapping += b.trackId
+            }
+        }
+        return overlapping.takeIf { it.size >= 2 } ?: emptySet()
+    }
+
+    @Synchronized
+    fun overlappingTracks(event: SpeechEvent): Set<Int> {
+        if (!event.hasReliableSourceTimestamp || event.endedAtMs < event.startedAtMs) return emptySet()
+        val windowStart = event.startedAtMs - PRE_SPEECH_MS
+        val trackIds = samples.asSequence()
+            .filter { it.atMs in windowStart..event.endedAtMs }
+            .map { it.trackId }
+            .toSet()
+        return overlappingTracks(event, trackIds)
+    }
+
+    @Synchronized
+    fun associateSeparatedSources(
+        event: SpeechEvent,
+        sources: List<ShortArray>,
+        candidateTrackIds: Set<Int>,
+        sampleRate: Int = 16_000,
+        windowMs: Long = 200L
+    ): Map<Int, Int> {
+        if (sources.size != 2 || candidateTrackIds.size < 2 || event.endedAtMs <= event.startedAtMs) return emptyMap()
+        val windowSamples = sampleRate * windowMs / 1000L
+        val windows = minOf(
+            ((event.endedAtMs - event.startedAtMs) / windowMs).toInt(),
+            sources.minOf { (it.size / windowSamples).toInt() }
+        )
+        if (windows < 3) return emptyMap()
+        val tracks = candidateTrackIds.sorted().take(2)
+        val audioProfiles = sources.map { source ->
+            (0 until windows).map { index ->
+                val start = (index * windowSamples).toInt()
+                val end = (start + windowSamples).toInt()
+                sqrt(source.sliceArray(start until end).map { it.toDouble() * it }.average()).toFloat()
+            }
+        }
+        val mouthProfiles = tracks.map { trackId ->
+            (0 until windows).map { index ->
+                val start = event.startedAtMs + index * windowMs
+                val end = start + windowMs
+                samples.asSequence()
+                    .filter { it.trackId == trackId && it.atMs in start..end }
+                    .map { it.activity.toDouble() }
+                    .average()
+                    .takeIf { it.isFinite() }
+                    ?.toFloat() ?: 0f
+            }
+        }
+        val direct = correlation(audioProfiles[0], mouthProfiles[0]) + correlation(audioProfiles[1], mouthProfiles[1])
+        val swapped = correlation(audioProfiles[0], mouthProfiles[1]) + correlation(audioProfiles[1], mouthProfiles[0])
+        val best = maxOf(direct, swapped)
+        if (best < MIN_SEPARATION_CORRELATION_SUM || kotlin.math.abs(direct - swapped) < MIN_SEPARATION_MARGIN) return emptyMap()
+        return if (direct > swapped) mapOf(0 to tracks[0], 1 to tracks[1]) else mapOf(0 to tracks[1], 1 to tracks[0])
+    }
+
+    private fun correlation(first: List<Float>, second: List<Float>): Double {
+        val meanFirst = first.average()
+        val meanSecond = second.average()
+        val centeredFirst = first.map { it - meanFirst }
+        val centeredSecond = second.map { it - meanSecond }
+        val denominator = sqrt(centeredFirst.sumOf { it * it } * centeredSecond.sumOf { it * it })
+        if (denominator < 1e-9) return 0.0
+        return centeredFirst.indices.sumOf { centeredFirst[it] * centeredSecond[it] } / denominator
+    }
+
+    @Synchronized
     fun removeTrackSamples(trackId: Int) {
         samples.removeIf { it.trackId == trackId }
     }
+
+    @Synchronized
+    fun samplesBetween(startedAtMs: Long, endedAtMs: Long): List<MouthSample> =
+        samples.filter { it.atMs in startedAtMs..endedAtMs }
 
     @Synchronized
     fun clear() {
@@ -88,5 +175,8 @@ class SpeakerAttributor {
         const val MIN_MARGIN_RATIO = 0.75f
         const val MIN_RATIO = 1.5f
         const val RECENT_ATTRIBUTION_TAIL_MS = 1_000L
+        const val OVERLAP_WINDOW_MS = 250L
+        const val MIN_SEPARATION_CORRELATION_SUM = 0.25
+        const val MIN_SEPARATION_MARGIN = 0.12
     }
 }

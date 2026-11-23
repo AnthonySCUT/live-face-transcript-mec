@@ -15,8 +15,27 @@ class FunAsrProtocolTest {
         assertEquals("2pass", message.getString("mode"))
         assertEquals("session-1", message.getString("wav_name"))
         assertTrue(message.getBoolean("is_speaking"))
+        assertEquals(16_000, message.getInt("audio_fs"))
         assertEquals("[5,10,5]", message.getJSONArray("chunk_size").toString())
         assertEquals(10, message.getInt("chunk_interval"))
+    }
+
+    @Test
+    fun stopMessageClosesTheInputStream() {
+        val message = JSONObject(FunAsrProtocol.stopMessage())
+
+        assertFalse(message.getBoolean("is_speaking"))
+        assertTrue(message.getBoolean("is_end"))
+    }
+
+    @Test
+    fun startupMessagePassesRegisteredNamesAsRecognitionContext() {
+        val message = JSONObject(FunAsrProtocol.startMessage("session-1", listOf("张三", "Alex", "张三")))
+        val hotwords = message.getJSONObject("hotwords")
+
+        assertEquals(20, hotwords.getInt("张三"))
+        assertEquals(20, hotwords.getInt("Alex"))
+        assertEquals(2, hotwords.length())
     }
 
     @Test
@@ -86,22 +105,24 @@ class FunAsrProtocolTest {
 
         assertEquals(1, fallback.startCount)
         assertEquals(listOf(2, 2), fallback.acceptedCounts)
-        assertTrue(statuses.any { it.contains("本地中文后备") })
+        assertTrue(statuses.any { it.contains("本地中英后备") })
         engine.stop()
     }
 
     @Test
-    fun finalResponseDuringStopDrainIsDelivered() {
+    fun everyFinalResponseDuringStopDrainIsDeliveredBeforeSocketClose() {
         val factory = FakeSocketFactory()
-        var finalText: String? = null
-        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine())
+        val finalTexts = mutableListOf<String>()
+        val engine = FunAsrSpeechEngine("ws://example.test", factory, RecordingSpeechEngine(), remoteDrainMs = 80L)
 
-        engine.start { if (it.isFinal) finalText = it.text }
+        engine.start { if (it.isFinal) finalTexts += it.text }
         factory.open()
         engine.stop()
+        factory.listener.onText("""{"mode":"2pass-offline","text":"第一段","is_final":true}""")
         factory.listener.onText("""{"mode":"2pass-offline","text":"最后一句","is_final":true}""")
 
-        assertEquals("最后一句", finalText)
+        assertEquals(listOf("第一段", "最后一句"), finalTexts)
+        assertTrue(engine.awaitStopDrain(500L))
         assertTrue(factory.socket.closed)
     }
 
@@ -115,7 +136,7 @@ class FunAsrProtocolTest {
         factory.fail(IllegalStateException("connection refused"))
         engine.acceptPcm(shortArrayOf(10, 20), 2, capturedAtMs = 100L)
 
-        assertTrue(statuses.any { it.contains("本地中文后备模型未加载") })
+        assertTrue(statuses.any { it.contains("本地中英后备模型未加载") })
         engine.stop()
     }
 
@@ -255,7 +276,7 @@ class FunAsrProtocolTest {
         assertEquals(1, fallback.startCount)
         assertEquals(listOf(voiced.size), fallback.acceptedCounts)
         assertTrue(factory.socket.closed)
-        assertTrue(statuses.any { it.contains("已切换本地中文后备") })
+        assertTrue(statuses.any { it.contains("已切换本地中英后备") })
         engine.stop()
     }
 
@@ -305,3 +326,4 @@ class FunAsrProtocolTest {
         override fun stop() = Unit
     }
 }
+

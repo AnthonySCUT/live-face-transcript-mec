@@ -15,7 +15,7 @@ Say each phrase live three times at a natural pace:
 | Mixed | 我们先 review the architecture，然后确认 deployment plan。 |
 | Mixed | Good morning，今天我们讨论 project architecture。 |
 
-Also run these attribution cases: one visible person speaking; two visible people with only one speaking; two visible people taking turns; speaker's mouth partly covered; and visible people with no speech. Do not use simultaneous speech as an acceptance case because source separation is outside this implementation.
+Also run these attribution cases: one visible person speaking; two visible people with only one speaking; two visible people taking turns; speaker's mouth partly covered; visible people with no speech; and two visible people speaking at the same time. For simultaneous speech, verify that the overlap window is sent to SepFormer, two separated streams are transcribed independently, each stream receives an enrolled voiceprint or a distinct Stranger label, and the corresponding visible mouth tracks are highlighted when correlation evidence is sufficient.
 
 ## Measurements
 

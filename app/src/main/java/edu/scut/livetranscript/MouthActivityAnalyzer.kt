@@ -17,7 +17,7 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
     private val landmarkerDelegate = lazy {
         val options = FaceLandmarker.FaceLandmarkerOptions.builder()
             .setBaseOptions(BaseOptions.builder().setModelAssetPath(MODEL_ASSET).build())
-            .setRunningMode(RunningMode.VIDEO)
+            .setRunningMode(RunningMode.IMAGE)
             .setNumFaces(MAX_FACES)
             .setOutputFaceBlendshapes(true)
             .build()
@@ -25,33 +25,39 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
     }
     private val landmarker by landmarkerDelegate
     private val previousMouthByTrack = mutableMapOf<Int, PreviousMouth>()
+    @Volatile var lastDiagnostic = "not-run"
+        private set
 
     fun process(bitmap: Bitmap, trackedFaces: List<TrackedFace>, atMs: Long): Int {
         if (trackedFaces.isEmpty()) {
             previousMouthByTrack.clear()
             attributor.clear()
+            lastDiagnostic = "landmarks=0,blendshapes=0,matched=0"
             return 0
         }
         val input = if (bitmap.config == Bitmap.Config.ARGB_8888) bitmap
         else bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return 0
         val ownsInput = input !== bitmap
+        val fallbackSource = input.copy(Bitmap.Config.ARGB_8888, false)
+            ?: error("Could not copy frame for per-face landmark analysis")
         val inputWidth = input.width
         val inputHeight = input.height
         try {
             val currentTrackIds = trackedFaces.map { it.id }.toSet()
             (previousMouthByTrack.keys - currentTrackIds).forEach(attributor::removeTrackSamples)
             previousMouthByTrack.keys.retainAll(currentTrackIds)
-            val result = BitmapImageBuilder(input).build().use { mpImage ->
-                landmarker.detectForVideo(mpImage, atMs)
-            }
+            val result = BitmapImageBuilder(input).build().use { mpImage -> landmarker.detect(mpImage) }
+            val landmarksByFace = result.faceLandmarks()
             val blendshapes = result.faceBlendshapes().orElse(emptyList())
             val matchedTrackIds = mutableSetOf<Int>()
             val usedTrackIds = mutableSetOf<Int>()
 
-            result.faceLandmarks().forEachIndexed { faceIndex, landmarks ->
+            var jawShapeCount = 0
+            landmarksByFace.forEachIndexed { faceIndex, landmarks ->
                 val mouthShapes = blendshapes.getOrNull(faceIndex)
                     ?.associate { it.categoryName() to it.score() }
                     ?.takeIf { it.containsKey(JAW_OPEN) } ?: return@forEachIndexed
+                jawShapeCount++
                 val faceBounds = boundsOf(landmarks, inputWidth, inputHeight) ?: return@forEachIndexed
                 val trackId = MouthTrackMatcher.selectTrack(
                     trackedFaces.asSequence()
@@ -63,17 +69,26 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
                 ) ?: return@forEachIndexed
                 val match = trackedFaces.firstOrNull { it.id == trackId } ?: return@forEachIndexed
 
-                val previous = previousMouthByTrack[match.id]
-                val elapsed = previous?.let { atMs - it.atMs } ?: 0L
-                if (previous != null && elapsed in MIN_SAMPLE_GAP_MS..MAX_SAMPLE_GAP_MS) {
-                    val activity = MouthMotionScore.activity(previous.shapes, mouthShapes)
-                    attributor.addSample(MouthSample(match.id, atMs, activity))
-                } else if (previous != null && elapsed > MAX_SAMPLE_GAP_MS) {
-                    attributor.removeTrackSamples(match.id)
-                }
-                previousMouthByTrack[match.id] = PreviousMouth(mouthShapes, atMs)
+                updateTrackMouth(match.id, mouthShapes, atMs)
                 matchedTrackIds += match.id
                 usedTrackIds += match.id
+            }
+
+            var cropLandmarkCount = 0
+            trackedFaces.filter { it.id !in matchedTrackIds }.forEach { track ->
+                val crop = squareFaceCrop(fallbackSource, track.bounds) ?: return@forEach
+                try {
+                    val cropResult = BitmapImageBuilder(crop).build().use { landmarker.detect(it) }
+                    val cropShapes = cropResult.faceBlendshapes().orElse(emptyList()).firstOrNull()
+                        ?.associate { it.categoryName() to it.score() }
+                        ?.takeIf { it.containsKey(JAW_OPEN) } ?: return@forEach
+                    cropLandmarkCount++
+                    jawShapeCount++
+                    updateTrackMouth(track.id, cropShapes, atMs)
+                    matchedTrackIds += track.id
+                } finally {
+                    crop.recycle()
+                }
             }
 
             (currentTrackIds - matchedTrackIds).forEach { trackId ->
@@ -83,8 +98,10 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
                     attributor.removeTrackSamples(trackId)
                 }
             }
+            lastDiagnostic = "landmarks=${landmarksByFace.size},crop=$cropLandmarkCount,blendshapes=${blendshapes.size},jaw=$jawShapeCount,matched=${matchedTrackIds.size}"
             return matchedTrackIds.size
         } finally {
+            if (!fallbackSource.isRecycled) fallbackSource.recycle()
             if (ownsInput && !input.isRecycled) input.recycle()
         }
     }
@@ -92,6 +109,30 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
     override fun close() {
         if (landmarkerDelegate.isInitialized()) landmarker.close()
         previousMouthByTrack.clear()
+    }
+
+    private fun squareFaceCrop(bitmap: Bitmap, bounds: RectF): Bitmap? {
+        val side = (max(bounds.width(), bounds.height()) * CROP_SCALE).toInt().coerceAtLeast(2)
+        val left = (bounds.centerX() - side / 2f).toInt().coerceIn(0, bitmap.width - 1)
+        val top = (bounds.centerY() - side / 2f).toInt().coerceIn(0, bitmap.height - 1)
+        val right = (left + side).coerceAtMost(bitmap.width)
+        val bottom = (top + side).coerceAtMost(bitmap.height)
+        if (right - left < 2 || bottom - top < 2) return null
+        val crop = Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+        val enlarged = Bitmap.createScaledBitmap(crop, CROP_INPUT_SIZE, CROP_INPUT_SIZE, true)
+        if (enlarged !== crop) crop.recycle()
+        return enlarged
+    }
+
+    private fun updateTrackMouth(trackId: Int, shapes: Map<String, Float>, atMs: Long) {
+        val previous = previousMouthByTrack[trackId]
+        val elapsed = previous?.let { atMs - it.atMs } ?: 0L
+        if (previous != null && elapsed in MIN_SAMPLE_GAP_MS..MAX_SAMPLE_GAP_MS) {
+            attributor.addSample(MouthSample(trackId, atMs, MouthMotionScore.activity(previous.shapes, shapes)))
+        } else if (previous != null && elapsed > MAX_SAMPLE_GAP_MS) {
+            attributor.removeTrackSamples(trackId)
+        }
+        previousMouthByTrack[trackId] = PreviousMouth(shapes, atMs)
     }
 
     private fun boundsOf(
@@ -126,5 +167,7 @@ class MouthActivityAnalyzer(context: Context, private val attributor: SpeakerAtt
         private const val MIN_FACE_OVERLAP_MARGIN = 0.08f
         private const val MIN_SAMPLE_GAP_MS = 80L
         private const val MAX_SAMPLE_GAP_MS = 1_000L
+        private const val CROP_SCALE = 2.0f
+        private const val CROP_INPUT_SIZE = 224
     }
 }

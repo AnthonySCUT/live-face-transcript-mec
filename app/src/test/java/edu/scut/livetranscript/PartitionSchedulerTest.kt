@@ -21,6 +21,15 @@ class PartitionSchedulerTest {
         val scheduler = calibrated()
         assertEquals(Partition.LOCAL, scheduler.choose(NetworkProbe(2.0, 2.0, 100.0), 1.0))
     }
+    @Test fun selectsRemoteWhenServerIsFastAndNetworkIsFast() {
+        val scheduler = PartitionScheduler().apply {
+            observe(Partition.LOCAL, Profile(300.0, 0.0, 0, 0, 1.0))
+            observe(Partition.ALIGNED, Profile(180.0, 30.0, 1000, 100, 1.0))
+            observe(Partition.REMOTE, Profile(5.0, 10.0, 1000, 100, 1.0))
+        }
+
+        assertEquals(Partition.REMOTE, scheduler.choose(fast, 1.0))
+    }
     private fun calibrated() = PartitionScheduler().apply {
         observe(Partition.LOCAL, Profile(100.0, 0.0, 0, 0, 1.0))
         observe(Partition.ALIGNED, Profile(20.0, 10.0, 1000, 100, 1.0))

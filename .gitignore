@@ -2,6 +2,8 @@ local.properties
 .gradle/
 .kotlin/
 .venv/
+**/.venv-asr/
+**/.venv-face/
 __pycache__/
 *.pyc
 **/build/
@@ -11,3 +13,10 @@ __pycache__/
 *.aab
 captures/
 .DS_Store
+/artifacts/
+/tmp/
+/server/artifacts/
+/build-verification.log
+/testdata/reproducible-video/ilves-full*
+/testdata/reproducible-video/obama-voa-source.mp4
+/testdata/reproducible-video/sources/white-house-press-briefing-2017-01-21-360p.mov

@@ -10,6 +10,9 @@ import android.graphics.YuvImage
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.MediaMetadataRetriever
+import android.util.Base64
+import android.util.Log
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.Gravity
@@ -38,45 +41,60 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.setPadding
 import com.google.android.material.card.MaterialCardView
+import org.json.JSONObject
 import org.opencv.android.OpenCVLoader
 import org.vosk.Model
 import org.vosk.android.StorageService
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val mouthExecutor = Executors.newSingleThreadExecutor()
+    private val overlapExecutor = Executors.newSingleThreadExecutor()
     private val processing = AtomicBoolean(false)
     private val mouthProcessing = AtomicBoolean(false)
     private val lastFrameAt = AtomicLong(0L)
     private val lastMouthFrameAt = AtomicLong(0L)
     private val tracker = FaceTracker()
     private val speakerAttributor = SpeakerAttributor()
+    private val pcmTimeline = PcmTimelineBuffer()
+    private val voiceEnrollment = VoiceprintEnrollment()
     private val store by lazy { LocalStore(this) }
     private val transcriptSession by lazy {
         TranscriptSession(
             resolveSpeaker = ::resolveSpeaker,
             onPreview = { generation, line ->
                 runOnUiThread {
-                    if (running && generation == sessionGeneration) transcriptPreview.text = "${line.speaker}：${line.text}"
+                    if (running && generation == sessionGeneration) {
+                        transcriptPreview.text = if (line.text.isBlank()) "等待语音…" else "${line.speaker}：${line.text}"
+                    }
                 }
             },
             onFinal = { generation, line ->
                 store.addUtterance(line.speaker, line.text)
                 runOnUiThread {
-                    if (generation == sessionGeneration) {
-                        refreshTranscriptList()
+                    refreshTranscriptList()
+                    if (generation == sessionGeneration || (!running && generation + 1 == sessionGeneration)) {
                         if (running) {
                             transcriptPreview.text = "${line.speaker}：${line.text}"
                             speechStatus.text = "已保存到本机 · $speechEngineStatus"
+                        } else {
+                            transcriptPreview.text = "${line.speaker}：${line.text}"
                         }
                     }
                 }
@@ -85,14 +103,19 @@ class MainActivity : AppCompatActivity() {
     }
     private val pipeline by lazy { FacePipeline(this) }
     private val mec by lazy { MecOffload(this, pipeline) }
+    private val replayLog by lazy { ReplayExperimentLog(this) }
     @Volatile private var mecMode = "本地"
+    @Volatile private var speechMode = "电脑端中英"
     @Volatile private var mecUrl = "http://10.0.2.2:8000"
+    @Volatile private var funasrUrl = BuildConfig.FUNASR_WS_URL
+    @Volatile private var overlapUrl = "http://10.0.2.2:8001/separate-and-transcribe"
     @Volatile private var mecSize = 640
     @Volatile private var mecLimit = 0
     @Volatile private var mecReset = false
     @Volatile private var mouthAnalyzer: MouthActivityAnalyzer? = null
     @Volatile private var mouthAnalysisUnavailable = false
     @Volatile private var running = false
+    @Volatile private var replayBusy = false
     @Volatile private var sessionGeneration = 0L
     private val speechEventLock = Any()
     @Volatile private var currentFaces: List<TrackedFace> = emptyList()
@@ -101,6 +124,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var frameHeight = 480
     @Volatile private var speechEngineStatus = "识别服务尚未启动"
     private var speechModel: Model? = null
+    private var speechEnglishModel: Model? = null
     private var speechEngine: SpeechEngine? = null
     private var audioRecord: AudioRecord? = null
     private var audioThread: Thread? = null
@@ -121,8 +145,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var nameInput: EditText
     private lateinit var liveBadge: TextView
     private lateinit var mecStatus: TextView
+    private lateinit var replayStatus: TextView
     private val exportMetrics = registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
         if (uri != null && mec.logFile.exists()) contentResolver.openOutputStream(uri)?.use { output -> mec.logFile.inputStream().use { it.copyTo(output) } }
+    }
+    private val exportReplayMetrics = registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        if (uri != null && replayLog.file.exists()) contentResolver.openOutputStream(uri)?.use { output -> replayLog.file.inputStream().use { it.copyTo(output) } }
+    }
+    private val exportEdgeDiagnostics = registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        if (uri != null && replayLog.edgeFile.exists()) contentResolver.openOutputStream(uri)?.use { output -> replayLog.edgeFile.inputStream().use { it.copyTo(output) } }
     }
 
     private val requestPermissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -143,6 +174,10 @@ class MainActivity : AppCompatActivity() {
         refreshParticipants()
         refreshTranscriptList()
         if (BuildConfig.DEBUG && intent.getBooleanExtra("mecBenchmark", false)) runSampleBenchmark()
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("videoBenchmark", false)) runVideoReplayBenchmark()
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("edgeBenchmark", false)) runEdgeCaseReplay()
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("speechBenchmark", false)) runWavSpeechBenchmark()
+        if (BuildConfig.DEBUG && intent.getBooleanExtra("overlapBenchmark", false)) runOverlapReplayBenchmark()
     }
 
     private fun buildScreen() {
@@ -151,7 +186,14 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(18))
             setBackgroundColor(0xFFF4F6F5.toInt())
         }
-        val scroll = ScrollView(this).apply { addView(page) }
+        val scroll = ScrollView(this).apply {
+            addView(page)
+            isFillViewport = true
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = false
+            scrollBarStyle = View.SCROLLBARS_INSIDE_INSET
+            scrollBarSize = dp(10)
+        }
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(0, bars.top, 0, bars.bottom)
@@ -161,8 +203,8 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.requestApplyInsets(scroll)
 
         page.addView(label("LIVE SESSION", 12f, 0xFF176B62.toInt(), true))
-        page.addView(label("人脸与语音记录", 25f, 0xFF172321.toInt(), true).top(4))
-        page.addView(label("实时音频通过已配置服务识别 · 不保存音频 · 转写文本仅保存在本机", 13f, 0xFF586561.toInt()).top(3))
+        page.addView(label("实时人脸、声纹与字幕", 25f, 0xFF172321.toInt(), true).top(4))
+        page.addView(label("音频实时发送至识别服务 · 人脸/声纹特征与转写文本保存在本机", 13f, 0xFF586561.toInt()).top(3))
 
         liveBadge = label("● 已停止", 13f, 0xFF586561.toInt(), true).top(10)
         page.addView(liveBadge)
@@ -187,7 +229,7 @@ class MainActivity : AppCompatActivity() {
         page.addView(card().apply { addView(cameraFrame, FrameLayout.LayoutParams(-1, -1)) }.top(12), LinearLayout.LayoutParams(-1, dp(450)))
 
         consent = CheckBox(this).apply {
-            text = "已告知参与者并取得人脸与语音识别同意"
+            text = "已告知参与者并取得人脸、声纹与语音识别同意"
             textSize = 13f
             setTextColor(0xFF33413D.toInt())
         }
@@ -210,10 +252,25 @@ class MainActivity : AppCompatActivity() {
             }
         }
         page.addView(options(listOf("本地", "对齐后卸载", "整帧卸载", "动态")) { mecMode = it })
+        page.addView(label("语音识别位置（停止采集后切换）", 12f, 0xFF586561.toInt()))
+        page.addView(options(listOf("电脑端中英", "本地中英", "本地中文", "本地英文")) { speechMode = it })
+        page.addView(label("人脸 MEC HTTP 服务地址", 12f, 0xFF586561.toInt()))
         page.addView(EditText(this).apply {
-            setSingleLine(true); textSize = 14f; hint = "电脑服务地址"
+            setSingleLine(true); textSize = 14f; hint = "人脸服务，例如 http://10.0.2.2:8000"
             setText(mecUrl)
             doAfterTextChanged { mecUrl = it.toString().trim().trimEnd('/'); mecReset = true }
+        })
+        page.addView(label("电脑端 FunASR WebSocket 地址", 12f, 0xFF586561.toInt()))
+        page.addView(EditText(this).apply {
+            setSingleLine(true); textSize = 14f; hint = "模拟器用 localhost；手机填电脑局域网 IP"
+            setText(funasrUrl)
+            doAfterTextChanged { funasrUrl = it.toString().trim() }
+        })
+        page.addView(label("双人重叠分离服务地址", 12f, 0xFF586561.toInt()))
+        page.addView(EditText(this).apply {
+            setSingleLine(true); textSize = 14f; hint = "例如 http://10.0.2.2:8001/separate-and-transcribe"
+            setText(overlapUrl)
+            doAfterTextChanged { overlapUrl = it.toString().trim() }
         })
         page.addView(label("输入图像最大边长", 12f, 0xFF586561.toInt()))
         page.addView(options(listOf("640", "480", "320")) { mecSize = it.toInt() })
@@ -223,6 +280,41 @@ class MainActivity : AppCompatActivity() {
         page.addView(mecStatus)
         page.addView(Button(this).apply { text = "导出实验 CSV"; isAllCaps = false; setOnClickListener { exportMetrics.launch("mec-experiments.csv") } })
         page.addView(Button(this).apply { text = "运行样例切分实验"; isAllCaps = false; setOnClickListener { runSampleBenchmark() } })
+
+        page.addView(label("可复现实验素材", 16f, 0xFF172321.toInt(), true).top(12))
+        page.addView(label("内置同源 MP4 / 16 kHz WAV；包含单人讲话、多镜头与观众画面。", 12f, 0xFF586561.toInt()))
+        replayStatus = label("等待运行", 12f, 0xFF586561.toInt()).top(4)
+        page.addView(replayStatus)
+        page.addView(Button(this).apply {
+            text = "回放 MP4：静态 + 动态人脸切分"
+            isAllCaps = false
+            setOnClickListener { runVideoReplayBenchmark() }
+        })
+        page.addView(Button(this).apply {
+            text = "边界回放：影视对话 / 多人 / 遮挡 / 出画"
+            isAllCaps = false
+            setOnClickListener { runEdgeCaseReplay() }
+        })
+        page.addView(Button(this).apply {
+            text = "回放 WAV：本地中英/英文 vs 电脑端中英"
+            isAllCaps = false
+            setOnClickListener { runWavSpeechBenchmark() }
+        })
+        page.addView(Button(this).apply {
+            text = "回放双人重叠：分离后并行转写"
+            isAllCaps = false
+            setOnClickListener { runOverlapReplayBenchmark() }
+        })
+        page.addView(Button(this).apply {
+            text = "导出复现实验 CSV"
+            isAllCaps = false
+            setOnClickListener { exportReplayMetrics.launch("reproducible-experiments.csv") }
+        })
+        page.addView(Button(this).apply {
+            text = "导出边界场景诊断 CSV"
+            isAllCaps = false
+            setOnClickListener { exportEdgeDiagnostics.launch("reproducible-edge-diagnostics.csv") }
+        })
 
         page.addView(label("参与者登记", 16f, 0xFF172321.toInt(), true).top(12))
         val enrollmentRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -238,6 +330,11 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { enrollSelectedFace() }
         })
         page.addView(enrollmentRow)
+        page.addView(Button(this).apply {
+            text = "录制选中人的声纹（5 秒）"
+            isAllCaps = false
+            setOnClickListener { startVoiceprintEnrollment() }
+        }.top(2))
         val participantStatusRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -314,6 +411,419 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun runVideoReplayBenchmark() {
+        if (running || replayBusy) {
+            replayStatus.text = "请先停止实时采集，并等待当前实验结束。"
+            return
+        }
+        replayBusy = true
+        replayStatus.text = "正在解码 MP4 并回放 320/640 输入、静态切分、动态网络阶段…"
+        val endpoint = mecUrl
+        analysisExecutor.execute {
+            var decodedFrames = emptyList<Pair<Long, Bitmap>>()
+            var rows = 0
+            try {
+                decodedFrames = decodeReplayFrames("obama-farewell-60s.mp4", listOf(2_000L, 40_000L, 59_000L))
+                mec.reset()
+                for (size in listOf(320, 640)) {
+                    val frames = decodedFrames.map { (atMs, bitmap) -> Triple(atMs, downscale(bitmap, size), bitmap) }
+                    try {
+                        for (limit in listOf(0, 512)) {
+                            for (mode in listOf("本地", "对齐后卸载", "整帧卸载")) {
+                                for ((atMs, frame, _) in frames) {
+                                    try {
+                                        val result = mec.run(frame, mode, endpoint, limit)
+                                        replayLog.face("obama-farewell-60s.mp4", "static_${mode}_size${size}", atMs,
+                                            frame.width, frame.height, limit, mode, result, emptyList())
+                                    } catch (error: Exception) {
+                                        replayLog.faceFailure("obama-farewell-60s.mp4", "static_${mode}_size${size}", atMs,
+                                            frame.width, frame.height, limit, mode, error.message ?: error.javaClass.simpleName)
+                                    }
+                                    rows++
+                                    if (rows % 6 == 0) runOnUiThread { replayStatus.text = "MP4 静态矩阵进行中：$rows 条记录" }
+                                }
+                            }
+                        }
+                    } finally {
+                        frames.forEach { (_, frame, original) -> if (frame !== original) frame.recycle() }
+                    }
+                }
+
+                var priorLimit = -1
+                val dynamicLimits = List(12) { 0 } + List(12) { 512 } + List(12) { 0 }
+                dynamicLimits.forEachIndexed { index, limit ->
+                    val (atMs, source) = decodedFrames[index % decodedFrames.size]
+                    val frame = downscale(source, 640)
+                    try {
+                        try {
+                            val result = mec.run(frame, "动态", endpoint, limit, forceProbe = limit != priorLimit)
+                            replayLog.face("obama-farewell-60s.mp4", "dynamic_network_phase_${if (limit == 0) "unlimited" else "512kbps"}",
+                                atMs, frame.width, frame.height, limit, "动态", result, emptyList())
+                        } catch (error: Exception) {
+                            replayLog.faceFailure("obama-farewell-60s.mp4", "dynamic_network_phase_${if (limit == 0) "unlimited" else "512kbps"}",
+                                atMs, frame.width, frame.height, limit, "动态", error.message ?: error.javaClass.simpleName)
+                        }
+                        rows++
+                        priorLimit = limit
+                    } finally { if (frame !== source) frame.recycle() }
+                }
+                val completedRows = rows
+                runOnUiThread { replayStatus.text = "MP4 回放完成：$completedRows 条；含静态切分与 0→512→0 kbps 动态网络阶段。" }
+            } catch (error: Exception) {
+                runOnUiThread { replayStatus.text = "MP4 实验失败：${error.localizedMessage ?: error.javaClass.simpleName}" }
+            } finally {
+                decodedFrames.forEach { it.second.recycle() }
+                replayBusy = false
+            }
+        }
+    }
+
+    private fun decodeReplayFrames(assetName: String, timestampsMs: List<Long>): List<Pair<Long, Bitmap>> {
+        val video = File(cacheDir, assetName)
+        assets.open("test/reproducible/$assetName").use { input -> video.outputStream().use(input::copyTo) }
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(video.absolutePath)
+        return try {
+            timestampsMs.map { atMs ->
+                atMs to (retriever.getFrameAtTime(atMs * 1_000L, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: error("无法从内置 MP4 解码 ${atMs}ms 帧"))
+            }
+        } finally {
+            retriever.release()
+            video.delete()
+        }
+    }
+
+    private data class EdgeReplayRow(val atMs: Long, val width: Int, val height: Int, val result: MecResult,
+        val tracks: List<TrackedFace>, val mouthMatchedTracks: Int)
+
+    private fun runEdgeCaseReplay() {
+        if (running || replayBusy) {
+            replayStatus.text = "请先停止实时采集，并等待当前实验结束。"
+            return
+        }
+        replayBusy = true
+        replayStatus.text = "正在回放影视快剪、多人物、遮挡与人物出画素材…"
+        val endpoint = mecUrl
+        analysisExecutor.execute {
+            val cases = listOf(
+                "two-speaker-overlap-20s.mp4" to "two_person_overlap",
+                "face-occlusion-20s.mp4" to "face_occlusion",
+                "faces-leave-frame-20s.mp4" to "face_leaves_frame",
+                "his-girl-friday-dialogue-20s.mp4" to "film_rapid_dialogue",
+                "his-girl-friday-crowd-20s.mp4" to "film_multi_person",
+                "his-girl-friday-occlusion-20s.mp4" to "film_multi_person_occlusion"
+            )
+            var rowCount = 0
+            val participants = store.participants()
+            try {
+                mec.reset()
+                for ((assetName, scenario) in cases) {
+                    val timestamps = when (scenario) {
+                        "two_person_overlap" -> (1_000L..4_000L step 200L).toList()
+                        "film_rapid_dialogue" -> (500L..19_500L step 500L).toList()
+                        "film_multi_person", "film_multi_person_occlusion" ->
+                            (1_000L..19_000L step 2_000L).toList()
+                        else -> listOf(2_000L, 4_000L, 6_000L, 8_000L, 10_000L, 12_000L, 15_000L, 19_000L)
+                    }
+                    val frames = decodeReplayFrames(assetName, timestamps)
+                    val replayBase = SystemClock.elapsedRealtime()
+                    tracker.clear()
+                    speakerAttributor.clear()
+                    val analyzer = MouthActivityAnalyzer(this, speakerAttributor)
+                    try {
+                        val results = frames.map { (atMs, bitmap) ->
+                            val result = mec.run(bitmap, "本地", endpoint, 0)
+                            val tracked = tracker.update(result.samples, participants, replayBase + atMs)
+                            val mouthMatchedTracks = analyzer.process(bitmap, tracked, replayBase + atMs)
+                            Log.i("EdgeReplay", "$scenario t=$atMs faces=${result.samples.size} ${analyzer.lastDiagnostic}")
+                            EdgeReplayRow(atMs, bitmap.width, bitmap.height, result, tracked, mouthMatchedTracks)
+                        }
+                        val overlapEvent = SpeechEvent("overlap-probe", replayBase + 1_000L, replayBase + 4_000L, true)
+                        val overlapIds = if (scenario == "two_person_overlap") speakerAttributor.overlappingTracks(overlapEvent) else emptySet()
+                        val overlapSamples = if (scenario == "two_person_overlap") {
+                            speakerAttributor.samplesBetween(overlapEvent.startedAtMs - 100L, overlapEvent.endedAtMs)
+                        } else emptyList()
+                        results.forEach { row ->
+                            replayLog.face(assetName, scenario, row.atMs, row.width, row.height, 0, "本地", row.result,
+                                row.tracks.map { "${it.id}:${it.label}" }, overlapIds)
+                            val mouthSamples = if (scenario == "two_person_overlap") overlapSamples else
+                                speakerAttributor.samplesBetween(replayBase + row.atMs - 1_000L, replayBase + row.atMs)
+                            replayLog.edge(assetName, scenario, row.atMs, row.result.samples.size,
+                                row.tracks.map { "${it.id}:${it.label}" }, row.mouthMatchedTracks, mouthSamples, overlapIds)
+                            rowCount++
+                        }
+                        val maxFaces = results.maxOfOrNull { it.result.samples.size } ?: 0
+                        val label = when (scenario) {
+                            "two_person_overlap" -> "嘴部重叠人脸 ${overlapIds.size}；MediaPipe样本 ${overlapSamples.size}"
+                            "film_rapid_dialogue" -> "快剪采样；最多检测 $maxFaces 张脸"
+                            "film_multi_person" -> "多人拼贴；最多检测 $maxFaces 张脸"
+                            "film_multi_person_occlusion" -> "多人遮挡；最多检测 $maxFaces 张脸"
+                            else -> "$scenario；最多检测 $maxFaces 张脸"
+                        }
+                        runOnUiThread { replayStatus.text = "$assetName：${results.size} 帧；$label" }
+                    } finally {
+                        analyzer.close()
+                        frames.forEach { it.second.recycle() }
+                    }
+                }
+                val completed = rowCount
+                runOnUiThread { replayStatus.text = "边界回放完成：$completed 条帧记录；已写入检测数、人脸轨迹与重叠候选。" }
+            } catch (error: Exception) {
+                runOnUiThread { replayStatus.text = "边界回放失败：${error.localizedMessage ?: error.javaClass.simpleName}" }
+            } finally { replayBusy = false }
+        }
+    }
+
+    private fun runOverlapReplayBenchmark() {
+        if (running || replayBusy) {
+            replayStatus.text = "请先停止实时采集，并等待当前实验结束。"
+            return
+        }
+        replayBusy = true
+        replayStatus.text = "正在同步回放双人嘴部活动与 20 秒重叠 PCM…"
+        val endpoint = overlapUrl
+        val faceEndpoint = mecUrl
+        analysisExecutor.execute {
+            try {
+                val videoName = "two-speaker-overlap-20s.mp4"
+                val replayBase = SystemClock.elapsedRealtime()
+                val frames = decodeReplayFrames(videoName, (1_000L..4_000L step 200L).toList())
+                val analyzer = MouthActivityAnalyzer(this, speakerAttributor)
+                val participants = store.participants()
+                val edgeRows = mutableListOf<EdgeReplayRow>()
+                tracker.clear()
+                speakerAttributor.clear()
+                mec.reset()
+                try {
+                    for ((atMs, bitmap) in frames) {
+                        val faceResult = mec.run(bitmap, "本地", faceEndpoint, 0)
+                        val tracked = tracker.update(faceResult.samples, participants, replayBase + atMs)
+                        val mouthMatchedTracks = analyzer.process(bitmap, tracked, replayBase + atMs)
+                        edgeRows += EdgeReplayRow(atMs, bitmap.width, bitmap.height, faceResult, tracked, mouthMatchedTracks)
+                    }
+                } finally {
+                    analyzer.close()
+                    frames.forEach { it.second.recycle() }
+                }
+                val matchEvent = SpeechEvent("overlap-probe", replayBase + 1_000L, replayBase + 4_000L, true)
+                val candidateTrackIds = speakerAttributor.overlappingTracks(
+                    matchEvent,
+                    edgeRows.flatMap { row -> row.tracks.map { it.id } }.toSet()
+                )
+                edgeRows.forEach { row ->
+                    val mouthSamples = speakerAttributor.samplesBetween(replayBase + row.atMs - 1_000L, replayBase + row.atMs)
+                    replayLog.edge(videoName, "two_person_overlap_audio_link", row.atMs, row.result.samples.size,
+                        row.tracks.map { "${it.id}:${it.label}" }, row.mouthMatchedTracks, mouthSamples, candidateTrackIds)
+                }
+
+                val wav = assets.open("test/reproducible/two-speaker-overlap-20s-16k-mono.wav").use { PcmWavReader.read(it.readBytes()) }
+                val requestBytes = ByteBuffer.allocate(wav.pcmBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .apply { wav.samples.forEach(::putShort) }.array()
+                val request = URL(endpoint).openConnection() as HttpURLConnection
+                request.connectTimeout = 10_000
+                request.readTimeout = 120_000
+                request.requestMethod = "POST"
+                request.doOutput = true
+                request.setFixedLengthStreamingMode(requestBytes.size)
+                request.setRequestProperty("Content-Type", "application/octet-stream")
+                val started = SystemClock.elapsedRealtime()
+                request.outputStream.use { it.write(requestBytes) }
+                val responseBytes = request.inputStream.use { it.readBytes() }
+                request.disconnect()
+                val response = JSONObject(String(responseBytes, Charsets.UTF_8))
+                val sources = response.getJSONArray("sources")
+                val matchStart = AUDIO_SAMPLE_RATE
+                val matchEnd = AUDIO_SAMPLE_RATE * 4
+                val matchingSources = mutableListOf<ShortArray>()
+                val matchedPcm = (0 until sources.length()).map { index ->
+                    val payload = Base64.decode(sources.getJSONObject(index).getString("audio_base64"), Base64.DEFAULT)
+                    val pcmView = ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                    ShortArray(pcmView.remaining()).also(pcmView::get).also { full ->
+                        matchingSources += full.copyOfRange(matchStart, minOf(matchEnd, full.size))
+                    }
+                }
+                val faceMapping = speakerAttributor.associateSeparatedSources(matchEvent, matchingSources, candidateTrackIds)
+                val labels = mutableListOf<String>()
+                val outputs = mutableListOf<String>()
+                for (index in 0 until sources.length()) {
+                    val source = sources.getJSONObject(index)
+                    val samples = matchedPcm[index]
+                    val identity = VoiceprintMatcher.match(VoiceprintExtractor.extract(samples), store.participants())
+                    val faceTrackId = faceMapping[index]
+                    val speaker = identity?.name ?: faceTrackId?.let(tracker::labelForTrackId)
+                        ?: "陌生人 ${('A'.code + index).toChar()}"
+                    val text = source.optString("text").trim()
+                    val status = if (text.isBlank()) "no_text" else "ok"
+                    if (text.isNotBlank()) {
+                        store.addUtterance(speaker, text)
+                        labels += speaker
+                        val face = faceTrackId?.let { " · 人脸轨迹 $it" } ?: " · 人脸关联待确认"
+                        outputs += "$speaker$face：$text"
+                    }
+                    replayLog.speech(
+                        "two_speaker_overlap", "two-speaker-overlap-20s-16k-mono.wav",
+                        "SepFormer+FunASR_${index + 1}_$speaker${faceTrackId?.let { "_faceTrack$it" } ?: "_faceUnconfirmed"}",
+                        wav.pcmBytes, wav.durationMs, (SystemClock.elapsedRealtime() - started).toDouble(),
+                        source.optDouble("asr_ms", 0.0),
+                        if (index == 0) requestBytes.size.toLong() else 0L,
+                        if (index == 0) responseBytes.size.toLong() else 0L,
+                        text, status
+                    )
+                }
+                runOnUiThread {
+                    refreshTranscriptList()
+                    transcriptPreview.text = outputs.joinToString("\n")
+                    replayStatus.text = "重叠分离完成：${labels.joinToString("、")}；嘴部候选 ${candidateTrackIds.size} 人；人脸关联 ${faceMapping.size} 路；设备 ${response.optString("device")}。"
+                }
+            } catch (error: Exception) {
+                runOnUiThread { replayStatus.text = "双人重叠分离失败：${error.localizedMessage ?: error.javaClass.simpleName}" }
+            } finally { replayBusy = false }
+        }
+    }
+
+    private data class SpeechReplayResult(
+        val text: String,
+        val wallMs: Double,
+        val firstResultMs: Double?,
+        val status: String,
+        val transfer: SpeechTransferMetrics
+    )
+
+    private fun runWavSpeechBenchmark() {
+        if (running || replayBusy) {
+            replayStatus.text = "请先停止实时采集，并等待当前实验结束。"
+            return
+        }
+        replayBusy = true
+        replayStatus.text = "正在准备同一 20 秒英语 WAV 的本地/电脑端语音对照…"
+        val endpoint = funasrUrl
+        fun launch(chineseModel: Model, englishModel: Model) {
+            analysisExecutor.execute {
+                try {
+                    val wav = assets.open("test/reproducible/obama-farewell-60s-16k-mono.wav").use { PcmWavReader.read(it.readBytes()) }
+                    check(wav.sampleRate == AUDIO_SAMPLE_RATE && wav.channels == 1) { "实验 WAV 必须为 16 kHz 单声道" }
+                    val comparisonSamples = wav.samples.copyOfRange(0, minOf(wav.samples.size, 20 * AUDIO_SAMPLE_RATE))
+                    val comparisonBytes = comparisonSamples.size * 2
+                    val comparisonDurationMs = comparisonSamples.size * 1000L / AUDIO_SAMPLE_RATE
+                    val bilingualSamples = comparisonSamples
+                    val bilingual = replaySpeech("本地中英默认", BilingualVoskSpeechEngine(chineseModel, englishModel), bilingualSamples, waitForRemote = false)
+                    replayLog.speech("local_bilingual_default", "obama-farewell-60s-16k-mono.wav", "本地中英默认",
+                        comparisonBytes, comparisonDurationMs, bilingual.wallMs, bilingual.firstResultMs,
+                        bilingual.transfer.uploadedPayloadBytes, bilingual.transfer.downloadedPayloadBytes, bilingual.text, bilingual.status)
+                    runOnUiThread { replayStatus.text = "本地中英默认模式完成：${bilingual.text.take(90)}；继续单模型对照…" }
+
+                    val local = replaySpeech("本地Vosk英文", VoskSpeechEngine(englishModel), comparisonSamples, waitForRemote = false)
+                    replayLog.speech("single_speaker_compare", "obama-farewell-60s-16k-mono.wav", "本地Vosk英文",
+                        comparisonBytes, comparisonDurationMs, local.wallMs, local.firstResultMs,
+                        local.transfer.uploadedPayloadBytes, local.transfer.downloadedPayloadBytes, local.text, local.status)
+                    runOnUiThread { replayStatus.text = "本地英文完成：${local.text.take(90)}；继续电脑端 FunASR…" }
+
+                    val remoteEngine = FunAsrSpeechEngine(
+                        endpoint = endpoint,
+                        fallback = null,
+                        onStatus = { message -> runOnUiThread { if (replayBusy) replayStatus.text = "电脑端 FunASR：$message" } },
+                        hotwords = store.participants().map { it.name }
+                    )
+                    val remote = replaySpeech("电脑端FunASR中英", remoteEngine, comparisonSamples, waitForRemote = true)
+                    replayLog.speech("single_speaker_compare", "obama-farewell-60s-16k-mono.wav", "电脑端FunASR中英",
+                        comparisonBytes, comparisonDurationMs, remote.wallMs, remote.firstResultMs,
+                        remote.transfer.uploadedPayloadBytes, remote.transfer.downloadedPayloadBytes, remote.text, remote.status)
+                    runOnUiThread {
+                        replayStatus.text = "WAV 对照完成：本地 ${local.status}；电脑端 ${remote.status}；CSV 已记录语音字节与字幕。"
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread { replayStatus.text = "WAV 实验失败：${error.localizedMessage ?: error.javaClass.simpleName}" }
+                } finally { replayBusy = false }
+            }
+        }
+
+        fun loadEnglish(chineseModel: Model) {
+            speechEnglishModel?.let { launch(chineseModel, it); return }
+            StorageService.unpack(
+                this,
+                "models/vosk-model-small-en-us-0.15",
+                "vosk-en",
+                { model -> speechEnglishModel = model; launch(chineseModel, model) },
+                { error ->
+                    replayBusy = false
+                    runOnUiThread { replayStatus.text = "本地英文模型加载失败：${error.message ?: "未知错误"}" }
+                }
+            )
+        }
+
+        speechModel?.let(::loadEnglish) ?: StorageService.unpack(
+            this,
+            "models/vosk-model-small-cn-0.22",
+            "vosk",
+            { model -> speechModel = model; loadEnglish(model) },
+            { error ->
+                replayBusy = false
+                runOnUiThread { replayStatus.text = "本地中文模型加载失败：${error.message ?: "未知错误"}" }
+            }
+        )
+    }
+
+    private fun replaySpeech(mode: String, engine: SpeechEngine, samples: ShortArray, waitForRemote: Boolean): SpeechReplayResult {
+        val finished = CountDownLatch(1)
+        val transcript = SpeechTranscriptAccumulator()
+        val status = AtomicReference(if (waitForRemote) "连接中" else "本地解码")
+        val startedAt = SystemClock.elapsedRealtime()
+        val firstResultAt = AtomicLong(0L)
+        val transfer = engine as? FunAsrSpeechEngine
+        engine.start { event ->
+            if (event.text.isNotBlank()) {
+                if (mode == "本地中英默认" && event.isFinal) {
+                    Log.i("BilingualReplay", "${event.startedAtMs}-${event.endedAtMs} confidence=${event.confidence} text=${event.text}")
+                }
+                firstResultAt.compareAndSet(0L, SystemClock.elapsedRealtime() - startedAt)
+                transcript.accept(event)
+                if (event.isFinal) finished.countDown()
+            }
+        }
+        if (waitForRemote && transfer != null) {
+            val connectionDeadline = SystemClock.elapsedRealtime() + 15_000L
+            while (!transfer.isRemoteReady() && transfer.connectionStatus() == "CONNECTING" && SystemClock.elapsedRealtime() < connectionDeadline) {
+                Thread.sleep(100L)
+            }
+            if (!transfer.isRemoteReady()) {
+                val connectionState = transfer.connectionStatus()
+                engine.stop()
+                return SpeechReplayResult("", (SystemClock.elapsedRealtime() - startedAt).toDouble(), null,
+                    "connect_$connectionState", transfer.transferMetrics())
+            }
+        }
+
+        val sourceStartAt = SystemClock.elapsedRealtime()
+        var offset = 0
+        val chunk = 1_600
+        while (offset < samples.size) {
+            val count = minOf(chunk, samples.size - offset)
+            val captureAt = sourceStartAt + (offset + count) * 1000L / AUDIO_SAMPLE_RATE
+            engine.acceptPcm(samples.copyOfRange(offset, offset + count), count, captureAt)
+            offset += count
+            val target = offset * 1000L / AUDIO_SAMPLE_RATE
+            val elapsed = SystemClock.elapsedRealtime() - sourceStartAt
+            if (target > elapsed) Thread.sleep(target - elapsed)
+        }
+        val silence = ShortArray(chunk)
+        repeat(8) { index ->
+            val captureAt = sourceStartAt + samples.size * 1000L / AUDIO_SAMPLE_RATE + index * 100L
+            engine.acceptPcm(silence, silence.size, captureAt)
+            Thread.sleep(100L)
+        }
+        engine.stop()
+        if (waitForRemote && transfer != null) transfer.awaitStopDrain(6_500L)
+        else finished.await(2, TimeUnit.SECONDS)
+        val elapsedMs = SystemClock.elapsedRealtime() - startedAt
+        val resultText = transcript.text()
+        status.set(if (resultText.isBlank()) "no_final_text" else "ok")
+        return SpeechReplayResult(
+            resultText, elapsedMs.toDouble(), firstResultAt.get().takeIf { it > 0L }?.toDouble(),
+            status.get(), transfer?.transferMetrics() ?: SpeechTransferMetrics(0, 0)
+        )
+    }
+
     private fun onStartClicked() {
         if (running) {
             stopSession()
@@ -337,6 +847,8 @@ class MainActivity : AppCompatActivity() {
         lastMouthFrameAt.set(0L)
         mouthAnalysisUnavailable = false
         speakerAttributor.clear()
+        pcmTimeline.clear()
+        voiceEnrollment.cancel()
         synchronized(speechEventLock) {
             sessionGeneration++
             tracker.clear()
@@ -368,7 +880,13 @@ class MainActivity : AppCompatActivity() {
                     .build()
                 analysis.setAnalyzer(cameraExecutor, ::analyzeFrame)
                 provider.unbindAll()
-                val selector = if (provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                val selector = when {
+                    provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA) -> CameraSelector.DEFAULT_FRONT_CAMERA
+                    provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA) -> CameraSelector.DEFAULT_BACK_CAMERA
+                    else -> CameraSelector.Builder()
+                        .addCameraFilter { cameras -> cameras.take(1) }
+                        .build()
+                }
                 provider.bindToLifecycle(this, selector, previewUseCase, analysis)
                 analysisUseCase = analysis
                 status.text = "摄像头与麦克风运行中 · 未知访客编号只在本次会话有效"
@@ -518,7 +1036,27 @@ class MainActivity : AppCompatActivity() {
         store.saveParticipant(name, candidate.embedding)
         nameInput.setText("")
         refreshParticipants()
-        status.text = "已在本机登记 $name。该参与者需已同意进行识别。"
+        status.text = "已在本机登记 $name。开始采集后可录制其声纹。"
+    }
+
+    private fun startVoiceprintEnrollment() {
+        if (!running || !audioCaptureRunning) {
+            status.text = "请先开始采集，再录制声纹。"
+            return
+        }
+        val face = currentFaces.firstOrNull { it.id == selectedTrackId }
+            ?: currentFaces.singleOrNull()
+        if (face == null) {
+            status.text = "请点选一张清晰人脸后录制声纹。"
+            return
+        }
+        val participant = store.participants().firstOrNull { it.name == face.label }
+        if (participant == null) {
+            status.text = "请先登记选中人脸的姓名，再录制声纹。"
+            return
+        }
+        voiceEnrollment.start(participant.name)
+        speechStatus.text = "正在登记 ${participant.name} 的声纹 · 请连续说话 5 秒"
     }
 
     private fun startSpeechRecognition() {
@@ -527,43 +1065,116 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (modelLoading) {
-            speechStatus.text = "正在加载本地中文后备模型…"
+            speechStatus.text = "正在加载语音模型…"
+            return
+        }
+        val generation = sessionGeneration
+        val selectedMode = speechMode
+        if (selectedMode == "电脑端中英") {
+            loadBilingualModels(generation) { fallback -> startFunAsrRecognition(fallback, generation) }
+            return
+        }
+        if (selectedMode == "本地中英") {
+            loadBilingualModels(generation) { engine ->
+                if (running && generation == sessionGeneration) {
+                    startAudioRecognition(engine, generation, "语音实际位置：手机 · 本地中英")
+                }
+            }
             return
         }
         modelLoading = true
-        speechEngineStatus = "正在加载本地中文后备模型…"
+        speechEngineStatus = "正在加载${selectedMode}模型…"
         speechStatus.text = speechEngineStatus
         StorageService.unpack(
             this,
-            "models/vosk-model-small-cn-0.22",
-            "vosk",
+            if (selectedMode == "本地英文") "models/vosk-model-small-en-us-0.15" else "models/vosk-model-small-cn-0.22",
+            if (selectedMode == "本地英文") "vosk-en" else "vosk",
             { model ->
                 modelLoading = false
-                speechModel = model
-                if (running) startFunAsrRecognition(VoskSpeechEngine(model), sessionGeneration)
+                if (selectedMode == "本地英文") { speechEnglishModel?.close(); speechEnglishModel = model }
+                else { speechModel?.close(); speechModel = model }
+                if (running && generation == sessionGeneration) startAudioRecognition(VoskSpeechEngine(model), generation, "语音实际位置：手机 · $selectedMode")
             },
             { error ->
                 modelLoading = false
-                speechEngineStatus = "本地中文后备加载失败：${error.message ?: "未知错误"}"
+                speechEngineStatus = "${selectedMode}模型加载失败：${error.message ?: "未知错误"}"
                 runOnUiThread { if (running) speechStatus.text = speechEngineStatus }
-                if (running) startFunAsrRecognition(null, sessionGeneration)
             }
         )
+    }
+
+    private fun loadBilingualModels(generation: Long, onReady: (SpeechEngine) -> Unit) {
+        val ready = {
+            val chinese = speechModel
+            val english = speechEnglishModel
+            if (chinese != null && english != null) {
+                modelLoading = false
+                if (running && generation == sessionGeneration) {
+                    onReady(BilingualVoskSpeechEngine(chinese, english))
+                }
+            }
+        }
+        val fail: (Throwable) -> Unit = { error ->
+            modelLoading = false
+            speechEngineStatus = "本地中英模型加载失败：${error.message ?: "未知错误"}"
+            runOnUiThread { if (running && generation == sessionGeneration) speechStatus.text = speechEngineStatus }
+        }
+        modelLoading = true
+        speechEngineStatus = "正在加载手机中英识别模型…"
+        speechStatus.text = speechEngineStatus
+
+        fun loadEnglish() {
+            if (speechEnglishModel != null) {
+                ready()
+                return
+            }
+            StorageService.unpack(
+                this,
+                "models/vosk-model-small-en-us-0.15",
+                "vosk-en",
+                { model -> speechEnglishModel = model; ready() },
+                fail
+            )
+        }
+
+        if (speechModel != null) {
+            loadEnglish()
+        } else {
+            StorageService.unpack(
+                this,
+                "models/vosk-model-small-cn-0.22",
+                "vosk",
+                { model -> speechModel = model; loadEnglish() },
+                fail
+            )
+        }
     }
 
     private fun startFunAsrRecognition(localFallback: SpeechEngine?, generation: Long) {
         if (!running || generation != sessionGeneration || audioCaptureRunning) return
         try {
             val engine = FunAsrSpeechEngine(
-                endpoint = BuildConfig.FUNASR_WS_URL,
+                endpoint = funasrUrl,
                 fallback = localFallback,
                 onStatus = { message ->
                     if (running && generation == sessionGeneration) {
                         speechEngineStatus = message
                         runOnUiThread { if (running && generation == sessionGeneration) speechStatus.text = message }
                     }
-                }
+                },
+                hotwords = store.participants().map { it.name }
             )
+            startAudioRecognition(engine, generation, "正在连接电脑端语音识别…")
+        } catch (error: Exception) {
+            speechEngineStatus = "语音启动失败：${error.localizedMessage ?: "未知错误"}"
+            runOnUiThread { speechStatus.text = speechEngineStatus }
+        }
+    }
+
+    private fun startAudioRecognition(engine: SpeechEngine, generation: Long, initialStatus: String) {
+        if (!running || generation != sessionGeneration || audioCaptureRunning) return
+        try {
+            speechEngineStatus = initialStatus
             speechEngine = engine
             engine.start { event -> onSpeechEvent(event, generation) }
             val minBuffer = AudioRecord.getMinBufferSize(
@@ -573,7 +1184,7 @@ class MainActivity : AppCompatActivity() {
             )
             check(minBuffer > 0) { "Android 无法创建 16 kHz 麦克风流（$minBuffer）" }
             val recorder = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC,
                 AUDIO_SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
@@ -617,11 +1228,27 @@ class MainActivity : AppCompatActivity() {
                 val rms = kotlin.math.sqrt(energy / count)
                 val levelDb = if (rms > 0.0) 20.0 * kotlin.math.log10(rms / 32768.0) else -96.0
                 val now = SystemClock.elapsedRealtime()
+                pcmTimeline.append(samples, count, now)
+                voiceEnrollment.append(samples, count)?.let { captured ->
+                    val embedding = captured.embedding
+                    if (embedding == null) {
+                        runOnUiThread { speechStatus.text = "声纹登记未采到足够清晰的语音 · 请重试" }
+                    } else {
+                        store.saveVoiceprint(captured.name, embedding)
+                        runOnUiThread {
+                            refreshParticipants()
+                            speechStatus.text = "${captured.name} 的声纹已保存在本机 · $speechEngineStatus"
+                        }
+                    }
+                }
                 if (now - lastMeterUpdate >= AUDIO_METER_INTERVAL_MS) {
                     lastMeterUpdate = now
                     val level = levelDb.roundToInt()
+                    val enrollmentName = voiceEnrollment.activeName()
                     runOnUiThread {
-                        speechStatus.text = if (level < MIN_AUDIBLE_DBFS) {
+                        speechStatus.text = if (enrollmentName != null) {
+                            "正在登记 $enrollmentName 的声纹 · 输入 ${level} dBFS"
+                        } else if (level < MIN_AUDIBLE_DBFS) {
                             "麦克风输入 ${level} dBFS · $speechEngineStatus"
                         } else {
                             "麦克风正在收音 ${level} dBFS · $speechEngineStatus"
@@ -644,21 +1271,128 @@ class MainActivity : AppCompatActivity() {
     private fun onSpeechEvent(event: SpeechEvent, generation: Long) {
         synchronized(speechEventLock) {
             if (!running || generation != sessionGeneration) return
+            if (event.isFinal) {
+                val overlappingIds = speakerAttributor.overlappingTracks(event)
+                if (overlappingIds.size >= 2) {
+                    transcriptPreview.text = "检测到 ${overlappingIds.size} 人嘴部同步 · 正在分离语音流…"
+                    overlapExecutor.execute { separateLiveOverlap(event, generation, overlappingIds) }
+                    return
+                }
+            }
             transcriptSession.accept(generation, event)
         }
     }
 
+    private fun separateLiveOverlap(event: SpeechEvent, generation: Long, trackIds: Set<Int>) {
+        val pcm = pcmTimeline.slice(event.startedAtMs, event.endedAtMs)
+        if (pcm.size < AUDIO_SAMPLE_RATE) {
+            transcriptSession.accept(generation, event, overlapSpeakerLabel(trackIds))
+            return
+        }
+        try {
+            val body = ByteBuffer.allocate(pcm.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .apply { pcm.forEach(::putShort) }.array()
+            val connection = URL(overlapUrl).openConnection() as HttpURLConnection
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 120_000
+            connection.requestMethod = "POST"
+            connection.doOutput = true
+            connection.setFixedLengthStreamingMode(body.size)
+            connection.setRequestProperty("Content-Type", "application/octet-stream")
+            connection.outputStream.use { it.write(body) }
+            val response = JSONObject(String(connection.inputStream.use { it.readBytes() }, Charsets.UTF_8))
+            connection.disconnect()
+            val sources = response.getJSONArray("sources")
+            val separated = (0 until sources.length()).map { index ->
+                val payload = Base64.decode(sources.getJSONObject(index).getString("audio_base64"), Base64.DEFAULT)
+                val pcmView = ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                ShortArray(pcmView.remaining()).also(pcmView::get)
+            }
+            val mapping = speakerAttributor.associateSeparatedSources(event, separated, trackIds)
+            var delivered = 0
+            for (index in 0 until sources.length()) {
+                val source = sources.getJSONObject(index)
+                val text = source.optString("text").trim()
+                if (text.isBlank()) continue
+                val sourceSamples = separated[index]
+                val voiceIdentity = VoiceprintMatcher.match(VoiceprintExtractor.extract(sourceSamples), store.participants())
+                val trackId = mapping[index]
+                val speaker = voiceIdentity?.name ?: trackId?.let(tracker::labelForTrackId) ?: "陌生人 ${('A'.code + index).toChar()}"
+                transcriptSession.accept(
+                    generation,
+                    SpeechEvent(text, event.startedAtMs, event.endedAtMs, true),
+                    speaker
+                )
+                if (trackId != null) showActiveSpeakerIds(setOf(trackId))
+                delivered++
+            }
+            if (delivered == 0) transcriptSession.accept(generation, event, overlapSpeakerLabel(trackIds))
+            else runOnUiThread { if (generation == sessionGeneration) speechStatus.text = "双人语音已拆分并分别转写 · FunASR" }
+        } catch (error: Exception) {
+            transcriptSession.accept(generation, event, overlapSpeakerLabel(trackIds))
+            runOnUiThread { if (generation == sessionGeneration) speechStatus.text = "重叠分离服务不可用 · ${error.localizedMessage ?: error.javaClass.simpleName}" }
+        }
+    }
+
+    private fun overlapSpeakerLabel(trackIds: Set<Int>): String {
+        val labels = trackIds.mapNotNull { id -> currentFaces.firstOrNull { it.id == id }?.label ?: tracker.labelForTrackId(id) }.distinct()
+        return if (labels.isEmpty()) "多人同时说话" else "多人同时说话（${labels.joinToString("、")}）"
+    }
+
     private fun resolveSpeaker(event: SpeechEvent): String? {
         val visibleFaces = currentFaces
-        val trackId = speakerAttributor.attribute(
-            event,
-            visibleFaces.map { it.id }.toSet()
-        )
-        return trackId?.let { selected -> visibleFaces.firstOrNull { it.id == selected }?.label }
+        val visibleIds = visibleFaces.map { it.id }.toSet()
+        val overlappingIds = speakerAttributor.overlappingTracks(event)
+        if (overlappingIds.size > 1) {
+            showActiveSpeakerIds(overlappingIds)
+            val names = overlappingIds.mapNotNull { id -> visibleFaces.firstOrNull { it.id == id }?.label ?: tracker.labelForTrackId(id) }.distinct()
+            return if (names.isEmpty()) "多人同时说话" else "多人同时说话（${names.joinToString("、")}）"
+        }
+
+        val trackId = speakerAttributor.attribute(event, visibleIds)
+        val visualFace = visibleFaces.firstOrNull { it.id == trackId }
+        val voiceSamples = if (event.hasReliableSourceTimestamp) {
+            pcmTimeline.slice(event.startedAtMs, event.endedAtMs)
+        } else ShortArray(0)
+        val voiceMatch = VoiceprintMatcher.match(VoiceprintExtractor.extract(voiceSamples), store.participants())
+        if (voiceMatch != null) {
+            val matchingFace = visibleFaces.firstOrNull { it.label == voiceMatch.name }
+            if (matchingFace != null) {
+                showActiveSpeakerIds(setOf(matchingFace.id))
+                return voiceMatch.name
+            }
+            if (visualFace != null) {
+                showActiveSpeakerIds(setOf(visualFace.id))
+                if (!visualFace.known) {
+                    tracker.confirmVoiceIdentity(visualFace.id, voiceMatch.name)
+                    val relabeled = visualFace.copy(label = voiceMatch.name, known = true)
+                    currentFaces = visibleFaces.map { if (it.id == relabeled.id) relabeled else it }
+                    runOnUiThread { overlay.submit(currentFaces, frameWidth, frameHeight) }
+                    return voiceMatch.name
+                }
+                if (visualFace.label != voiceMatch.name) {
+                    return "身份待复核（声纹${voiceMatch.name}／人脸${visualFace.label}）"
+                }
+            }
+            showActiveSpeakerIds(emptySet())
+            return if (visibleFaces.isEmpty()) "${voiceMatch.name}（人脸暂不可见）" else "${voiceMatch.name}（人脸未定位）"
+        }
+        if (visualFace != null) {
+            showActiveSpeakerIds(setOf(visualFace.id))
+            return visualFace.label
+        }
+        showActiveSpeakerIds(emptySet())
+        return null
+    }
+
+    private fun showActiveSpeakerIds(ids: Set<Int>) {
+        runOnUiThread { if (::overlay.isInitialized) overlay.setActiveSpeakerIds(ids) }
     }
 
     private fun refreshParticipants() {
-        peopleStatus.text = "身份库 ${store.participants().size} 人 · 本机保存"
+        val participants = store.participants()
+        val withVoice = participants.count { it.voiceEmbedding != null }
+        peopleStatus.text = "身份库 ${participants.size} 人 · 声纹 $withVoice 人 · 本机保存"
     }
 
     private fun showParticipantManager() {
@@ -684,7 +1418,8 @@ class MainActivity : AppCompatActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            row.addView(label(participant.name, 14f, 0xFF172321.toInt()), LinearLayout.LayoutParams(0, -2, 1f))
+            val voiceState = if (participant.voiceEmbedding == null) "未登记声纹" else "已登记声纹"
+            row.addView(label("${participant.name} · $voiceState", 14f, 0xFF172321.toInt()), LinearLayout.LayoutParams(0, -2, 1f))
             row.addView(Button(this).apply {
                 text = "改名"
                 isAllCaps = false
@@ -766,8 +1501,31 @@ class MainActivity : AppCompatActivity() {
             val item = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(7), 0, dp(7)) }
             item.addView(label("${formatter.format(Date(row.timestamp))} · ${row.speaker}", 11f, 0xFF176B62.toInt(), true))
             item.addView(label(row.text, 14f, 0xFF172321.toInt()).top(2))
+            item.setOnClickListener { editUtterance(row) }
             transcriptList.addView(item)
         }
+    }
+
+    private fun editUtterance(utterance: Utterance) {
+        val input = EditText(this).apply {
+            setText(utterance.text)
+            setSelection(text.length)
+            minLines = 2
+            maxLines = 6
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("修正已保存转写")
+            .setMessage("${utterance.speaker} · 修改后覆盖本机保存的文字")
+            .setView(input)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存修改") { _, _ ->
+                val corrected = input.text.toString().trim()
+                if (corrected.isNotEmpty()) {
+                    store.updateUtterance(utterance.id, corrected)
+                    refreshTranscriptList()
+                }
+            }
+            .show()
     }
 
     private fun confirmClearHistory() {
@@ -784,15 +1542,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopSession() {
-        synchronized(speechEventLock) {
+        val stoppedGeneration = synchronized(speechEventLock) {
             val stoppedGeneration = sessionGeneration
             running = false
             sessionGeneration++
-            transcriptSession.stop(stoppedGeneration)
             tracker.clear()
             currentFaces = emptyList()
+            stoppedGeneration
         }
         audioCaptureRunning = false
+        voiceEnrollment.cancel()
         val recorder = audioRecord
         audioRecord = null
         try {
@@ -806,8 +1565,19 @@ class MainActivity : AppCompatActivity() {
             Thread.currentThread().interrupt()
         }
         audioThread = null
-        speechEngine?.stop()
+        val stoppedEngine = speechEngine
         speechEngine = null
+        stoppedEngine?.stop()
+        if (stoppedEngine is FunAsrSpeechEngine) {
+            Thread {
+                try { Thread.sleep(5_500L) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+                transcriptSession.stop(stoppedGeneration)
+                pcmTimeline.clear()
+            }.apply { name = "transcript-final-drain"; isDaemon = true; start() }
+        } else {
+            transcriptSession.stop(stoppedGeneration)
+            pcmTimeline.clear()
+        }
         analysisUseCase?.clearAnalyzer()
         analysisUseCase = null
         cameraProvider?.unbindAll()
@@ -818,6 +1588,7 @@ class MainActivity : AppCompatActivity() {
             speakerAttributor.clear()
         }
         overlay.submit(emptyList(), frameWidth, frameHeight)
+        overlay.setActiveSpeakerIds(emptySet())
         overlay.selectedId = null
         selectedTrackId = null
         startButton.text = "开始采集"
@@ -893,9 +1664,12 @@ class MainActivity : AppCompatActivity() {
         if (::overlay.isInitialized) stopSession()
         speechModel?.close()
         speechModel = null
+        speechEnglishModel?.close()
+        speechEnglishModel = null
         cameraExecutor.shutdown()
         analysisExecutor.shutdown()
         mouthExecutor.shutdown()
+        overlapExecutor.shutdown()
         store.close()
         super.onDestroy()
     }

@@ -4,6 +4,7 @@ plugins {
 }
 
 def funasrWsUrl = providers.gradleProperty('funasrWsUrl').getOrElse('ws://localhost:10095')
+def targetAbis = providers.gradleProperty('targetAbis').orNull
 
 android {
     namespace 'edu.scut.livetranscript'
@@ -17,6 +18,9 @@ android {
         versionCode 1
         versionName '1.0'
         buildConfigField 'String', 'FUNASR_WS_URL', "\"${funasrWsUrl}\""
+        if (targetAbis) {
+            ndk { targetAbis.split(',').each { abiFilters it.trim() } }
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

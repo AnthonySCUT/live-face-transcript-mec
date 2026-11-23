@@ -75,13 +75,24 @@ class FaceTracker {
         return "未确认说话人"
     }
 
+    @Synchronized fun confirmVoiceIdentity(trackId: Int, label: String) {
+        tracks.firstOrNull { it.id == trackId }?.let {
+            it.label = label
+            it.known = true
+        }
+    }
+
+    @Synchronized fun labelForTrackId(trackId: Int): String? = tracks.firstOrNull { it.id == trackId }?.label
+
     private fun iou(a: RectF, b: RectF): Double {
         val left = maxOf(a.left, b.left)
         val top = maxOf(a.top, b.top)
         val right = minOf(a.right, b.right)
         val bottom = minOf(a.bottom, b.bottom)
         val intersection = (maxOf(0f, right - left) * maxOf(0f, bottom - top)).toDouble()
-        val union = (a.width() * a.height() + b.width() * b.height()).toDouble() - intersection
+        val areaA = (a.right - a.left) * (a.bottom - a.top)
+        val areaB = (b.right - b.left) * (b.bottom - b.top)
+        val union = (areaA + areaB).toDouble() - intersection
         return if (union <= 0.0) 0.0 else intersection / union
     }
 
@@ -96,5 +107,5 @@ class FaceTracker {
         return "陌生人 ${letters.reverse()}"
     }
 
-    companion object { private const val TRACK_TIMEOUT_MS = 2200L }
+    companion object { private const val TRACK_TIMEOUT_MS = 8_000L }
 }

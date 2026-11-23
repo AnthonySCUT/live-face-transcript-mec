@@ -132,6 +132,66 @@ class SpeakerAttributorTest {
         assertNull(attributor.attribute(event, setOf(1, 2)))
     }
 
+    @Test
+    fun detectsTwoFacesWithConcurrentMouthMotion() {
+        val attributor = attributor(
+            MouthSample(1, 1_000, 0.03f), MouthSample(1, 1_100, 0.04f),
+            MouthSample(2, 1_050, 0.03f), MouthSample(2, 1_150, 0.04f)
+        )
+
+        assertEquals(setOf(1, 2), attributor.overlappingTracks(SpeechEvent("hello", 1_000, 1_200, true), setOf(1, 2)))
+    }
+
+    @Test
+    fun detectsOverlapAcrossTheFullSpeechWindowWhenTheTailIsQuiet() {
+        val attributor = attributor(
+            MouthSample(1, 1_200, 0.04f), MouthSample(2, 1_250, 0.04f),
+            MouthSample(1, 3_800, 0.00f), MouthSample(2, 3_850, 0.00f)
+        )
+
+        assertEquals(setOf(1, 2), attributor.overlappingTracks(SpeechEvent("hello", 1_000, 4_000, true), setOf(1, 2)))
+    }
+
+    @Test
+    fun sequentialMouthMotionDoesNotCountAsOverlap() {
+        val attributor = attributor(
+            MouthSample(1, 1_100, 0.04f), MouthSample(1, 1_200, 0.05f),
+            MouthSample(2, 1_700, 0.04f), MouthSample(2, 1_800, 0.05f)
+        )
+
+        assertEquals(emptySet<Int>(), attributor.overlappingTracks(SpeechEvent("hello", 1_000, 4_000, true), setOf(1, 2)))
+    }
+
+    @Test
+    fun associatesSeparatedAudioWithTheMatchingMouthActivityPattern() {
+        val attributor = attributor(
+            MouthSample(1, 1_050, 0.9f), MouthSample(1, 1_250, 0.1f), MouthSample(1, 1_450, 0.9f), MouthSample(1, 1_650, 0.1f),
+            MouthSample(2, 1_050, 0.1f), MouthSample(2, 1_250, 0.9f), MouthSample(2, 1_450, 0.1f), MouthSample(2, 1_650, 0.9f)
+        )
+        val first = shortArrayOf(8_000, 8_000, 500, 500, 8_000, 8_000, 500, 500)
+        val second = shortArrayOf(500, 500, 8_000, 8_000, 500, 500, 8_000, 8_000)
+
+        assertEquals(
+            mapOf(0 to 1, 1 to 2),
+            attributor.associateSeparatedSources(SpeechEvent("overlap", 1_000, 1_800, true), listOf(first, second), setOf(1, 2), sampleRate = 10)
+        )
+    }
+
+    @Test
+    fun ambiguousMouthPatternsDoNotForceAnAudioToFaceAssignment() {
+        val attributor = attributor(
+            MouthSample(1, 1_050, 0.4f), MouthSample(1, 1_250, 0.4f), MouthSample(1, 1_450, 0.4f),
+            MouthSample(2, 1_050, 0.4f), MouthSample(2, 1_250, 0.4f), MouthSample(2, 1_450, 0.4f)
+        )
+        val first = shortArrayOf(100, 200, 300, 400)
+        val second = shortArrayOf(400, 300, 200, 100)
+
+        assertEquals(
+            emptyMap<Int, Int>(),
+            attributor.associateSeparatedSources(SpeechEvent("overlap", 1_000, 1_600, true), listOf(first, second), setOf(1, 2), sampleRate = 10)
+        )
+    }
+
     private fun attributor(vararg samples: MouthSample) = SpeakerAttributor().apply {
         samples.forEach(::addSample)
     }

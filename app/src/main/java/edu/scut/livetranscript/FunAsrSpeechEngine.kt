@@ -8,7 +8,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.log10
 import kotlin.math.sqrt
 
@@ -66,7 +68,9 @@ class FunAsrSpeechEngine(
     private val endpoint: String,
     private val socketFactory: FunAsrSocketFactory = OkHttpFunAsrSocketFactory(),
     private val fallback: SpeechEngine?,
-    private val onStatus: (String) -> Unit = {}
+    private val onStatus: (String) -> Unit = {},
+    private val hotwords: List<String> = emptyList(),
+    private val remoteDrainMs: Long = REMOTE_DRAIN_MS
 ) : SpeechEngine {
     private enum class State { STOPPED, CONNECTING, REMOTE, DRAINING, FALLBACK }
 
@@ -86,6 +90,17 @@ class FunAsrSpeechEngine(
     private var responseSpeechWindow: SpeechWindow? = null
     private var latestCapturedAtMs = 0L
     private var previousPartial = ""
+    private val uploadedPayloadBytes = AtomicLong(0L)
+    private val downloadedPayloadBytes = AtomicLong(0L)
+    private var drainCompletion: CountDownLatch? = null
+
+    fun transferMetrics() = SpeechTransferMetrics(uploadedPayloadBytes.get(), downloadedPayloadBytes.get())
+    fun connectionStatus() = synchronized(lock) { state.name }
+    fun isRemoteReady() = connectionStatus() == State.REMOTE.name
+    fun awaitStopDrain(timeoutMs: Long): Boolean {
+        val completion = synchronized(lock) { drainCompletion } ?: return true
+        return completion.await(timeoutMs, TimeUnit.MILLISECONDS)
+    }
 
     override fun start(onEvent: (SpeechEvent) -> Unit) {
         synchronized(lock) {
@@ -100,12 +115,18 @@ class FunAsrSpeechEngine(
             latestCapturedAtMs = 0L
             previousPartial = ""
             fallbackStarted = false
+            drainCompletion = null
+            uploadedPayloadBytes.set(0L)
+            downloadedPayloadBytes.set(0L)
         }
         onStatus("正在连接中英实时识别服务…")
         try {
             socketFactory.connect(endpoint, object : FunAsrSocketListener {
                 override fun onOpen(socket: FunAsrSocket) = onSocketOpen(socket)
-                override fun onText(text: String) = onRemoteText(text)
+                override fun onText(text: String) {
+                    downloadedPayloadBytes.addAndGet(text.toByteArray().size.toLong())
+                    onRemoteText(text)
+                }
                 override fun onFailure(error: Throwable) = switchToFallback(error)
                 override fun onClosed() = switchToFallback(IllegalStateException("远端识别连接已关闭"))
             })
@@ -135,8 +156,10 @@ class FunAsrSpeechEngine(
                 val shouldSend = synchronized(lock) { state == State.FALLBACK && fallbackStarted }
                 if (shouldSend) fallback?.acceptPcm(frame.samples, frame.samples.size, frame.capturedAtMs)
             }
-        } else if (remoteSocket != null && !remoteSocket!!.sendBinary(FunAsrProtocol.encodePcm(frame.samples, frame.samples.size))) {
-            switchToFallback(IllegalStateException("远端识别服务未接收音频"), listOf(frame))
+        } else if (remoteSocket != null) {
+            val payload = FunAsrProtocol.encodePcm(frame.samples, frame.samples.size)
+            if (remoteSocket!!.sendBinary(payload)) uploadedPayloadBytes.addAndGet(payload.size.toLong())
+            else switchToFallback(IllegalStateException("远端识别服务未接收音频"), listOf(frame))
         }
     }
 
@@ -144,6 +167,7 @@ class FunAsrSpeechEngine(
         synchronized(fallbackLock) {
             val activeSocket: FunAsrSocket?
             val shouldStopFallback: Boolean
+            var stopDrain: CountDownLatch? = null
             synchronized(lock) {
                 if (state == State.STOPPED || state == State.DRAINING) return
                 activeSocket = socket
@@ -153,6 +177,8 @@ class FunAsrSpeechEngine(
                 previousPartial = ""
                 if (activeSocket != null) {
                     state = State.DRAINING
+                    stopDrain = CountDownLatch(1)
+                    drainCompletion = stopDrain
                 } else {
                     speechWindows.clear()
                     activeSpeechWindow = null
@@ -163,9 +189,11 @@ class FunAsrSpeechEngine(
                 }
             }
             if (activeSocket != null) {
-                activeSocket.sendText(FunAsrProtocol.stopMessage())
+                val drain = checkNotNull(stopDrain)
+                val stopMessage = FunAsrProtocol.stopMessage()
+                if (activeSocket.sendText(stopMessage)) uploadedPayloadBytes.addAndGet(stopMessage.toByteArray().size.toLong())
                 Thread {
-                    try { Thread.sleep(REMOTE_DRAIN_MS) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
+                    try { Thread.sleep(remoteDrainMs) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
                     val closeSocket = synchronized(lock) {
                         if (state != State.DRAINING) false else {
                             state = State.STOPPED
@@ -178,6 +206,7 @@ class FunAsrSpeechEngine(
                         }
                     }
                     if (closeSocket) activeSocket.close()
+                    drain.countDown()
                 }.apply { name = "funasr-stop-drain"; isDaemon = true; start() }
             } else if (shouldStopFallback) {
                 fallback?.stop()
@@ -192,15 +221,19 @@ class FunAsrSpeechEngine(
                 openSocket.close()
                 return
             }
-            if (!openSocket.sendText(FunAsrProtocol.startMessage(UUID.randomUUID().toString()))) {
+            val startMessage = FunAsrProtocol.startMessage(UUID.randomUUID().toString(), hotwords)
+            if (!openSocket.sendText(startMessage)) {
                 setupFailed = true
             } else {
+                uploadedPayloadBytes.addAndGet(startMessage.toByteArray().size.toLong())
                 while (pendingFrames.isNotEmpty()) {
                     val frame = pendingFrames.first()
-                    if (!openSocket.sendBinary(FunAsrProtocol.encodePcm(frame.samples, frame.samples.size))) {
+                    val payload = FunAsrProtocol.encodePcm(frame.samples, frame.samples.size)
+                    if (!openSocket.sendBinary(payload)) {
                         setupFailed = true
                         break
                     }
+                    uploadedPayloadBytes.addAndGet(payload.size.toLong())
                     pendingFrames.removeFirst()
                     pendingSampleCount -= frame.samples.size
                 }
@@ -221,7 +254,6 @@ class FunAsrSpeechEngine(
     private fun onRemoteText(message: String) {
         var event: SpeechEvent? = null
         var output: ((SpeechEvent) -> Unit)? = null
-        var socketToClose: FunAsrSocket? = null
         synchronized(lock) {
             if (state != State.REMOTE && state != State.DRAINING) return
             val response = FunAsrProtocol.parseMessage(message) ?: return
@@ -253,18 +285,8 @@ class FunAsrSpeechEngine(
                     output = callback
                 }
             }
-            if (state == State.DRAINING && response.isFinal) {
-                state = State.STOPPED
-                callback = null
-                socketToClose = socket
-                socket = null
-                speechWindows.clear()
-                activeSpeechWindow = null
-                responseSpeechWindow = null
-            }
         }
         event?.let { output?.invoke(it) }
-        socketToClose?.close()
     }
 
     private fun resolvePartialWindowLocked(): SpeechWindow? {
@@ -326,7 +348,7 @@ class FunAsrSpeechEngine(
             activeSocket?.close()
             val localFallback = fallback
             if (localFallback == null) {
-                onStatus("远端识别服务不可用，且本地中文后备模型未加载")
+                onStatus("远端识别服务不可用，且本地中英后备模型未加载")
                 return
             }
             try {
@@ -339,7 +361,7 @@ class FunAsrSpeechEngine(
                     }
                 }
                 queuedFrames.forEach { frame -> localFallback.acceptPcm(frame.samples, frame.samples.size, frame.capturedAtMs) }
-                onStatus("远端服务暂不可用，已切换本地中文后备（${error.message ?: "连接失败"}）")
+                onStatus("远端服务暂不可用，已切换本地中英后备（${error.message ?: "连接失败"}）")
             } catch (fallbackError: Exception) {
                 synchronized(lock) {
                     callback = null
@@ -401,24 +423,32 @@ class FunAsrSpeechEngine(
         const val MAX_SPEECH_WINDOW_AGE_MS = 30_000L
         const val MAX_SPEECH_WINDOWS = 64
         const val MAX_PENDING_SAMPLES = SAMPLE_RATE * 3
-        const val REMOTE_DRAIN_MS = 750L
+        const val REMOTE_DRAIN_MS = 5_000L
     }
 }
 
 object FunAsrProtocol {
     private val SENSEVOICE_TAG_REGEX = Regex("<\\|[^|]+\\|>")
 
-    fun startMessage(sessionId: String): String = JSONObject()
-        .put("mode", "2pass")
-        .put("wav_name", sessionId)
-        .put("is_speaking", true)
-        .put("chunk_size", JSONArray(listOf(5, 10, 5)))
-        .put("chunk_interval", 10)
-        .put("encoder_chunk_look_back", 4)
-        .put("decoder_chunk_look_back", 1)
-        .toString()
+    fun startMessage(sessionId: String, hotwords: List<String> = emptyList()): String {
+        val message = JSONObject()
+            .put("mode", "2pass")
+            .put("wav_name", sessionId)
+            .put("is_speaking", true)
+            .put("audio_fs", 16_000)
+            .put("chunk_size", JSONArray(listOf(5, 10, 5)))
+            .put("chunk_interval", 10)
+            .put("encoder_chunk_look_back", 4)
+            .put("decoder_chunk_look_back", 1)
+        if (hotwords.isNotEmpty()) {
+            val context = JSONObject()
+            hotwords.distinct().filter { it.isNotBlank() }.forEach { context.put(it, 20) }
+            if (context.length() > 0) message.put("hotwords", context)
+        }
+        return message.toString()
+    }
 
-    fun stopMessage(): String = JSONObject().put("is_speaking", false).toString()
+    fun stopMessage(): String = JSONObject().put("is_speaking", false).put("is_end", true).toString()
 
     fun encodePcm(samples: ShortArray, count: Int): ByteArray {
         require(count in 0..samples.size)
