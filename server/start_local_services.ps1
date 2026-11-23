@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $PSScriptRoot 'artifacts\logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null

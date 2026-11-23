@@ -1,4 +1,4 @@
-param([switch]$Stop)
+﻿param([switch]$Stop)
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot

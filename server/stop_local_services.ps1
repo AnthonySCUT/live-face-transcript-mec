@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $logDir = Join-Path $PSScriptRoot 'artifacts\logs'
 $services = @(
     @{ Name = 'overlap'; Script = 'server/overlap_server.py'; Port = 8001 },
